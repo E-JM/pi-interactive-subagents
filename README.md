@@ -27,6 +27,7 @@ subagent({ name: "Scout: DB", agent: "scout", task: "Map database schema" });
 
 ```bash
 pi install git:github.com/HazAT/pi-interactive-subagents
+pi install git:github.com/E-JM/pi-interactive-subagents
 ```
 
 Supported multiplexers:
@@ -35,6 +36,7 @@ Supported multiplexers:
 - [tmux](https://github.com/tmux/tmux)
 - [zellij](https://zellij.dev)
 - [WezTerm](https://wezfurlong.org/wezterm/) (terminal emulator with built-in multiplexing)
+- [herdr](https://herdr.dev)
 
 Start pi inside one of them:
 
@@ -45,10 +47,12 @@ tmux new -A -s pi 'pi'
 # or
 zellij --session pi   # then run: pi
 # or
+herdr                 # then run: pi
+# or
 # just run pi inside WezTerm — no wrapper needed
 ```
 
-Optional: set `PI_SUBAGENT_MUX=cmux|tmux|zellij|wezterm` to force a specific backend.
+Optional: set `PI_SUBAGENT_MUX=cmux|tmux|zellij|wezterm|herdr` to force a specific backend.
 
 If your shell startup is slow and subagent commands sometimes get dropped before the prompt is ready, set `PI_SUBAGENT_SHELL_READY_DELAY_MS` to a higher value (defaults to `500`):
 
@@ -499,7 +503,3 @@ export PI_SUBAGENT_MUX=cmux   # or tmux, zellij, wezterm, herdr
 The sub-agent status supervision and turn-only interruption features were inspired by [RepoPrompt](https://repoprompt.com/)'s sub-agent snapshot polling and run cancellation features.
 
 ---
-
-## License
-
-MIT
