@@ -282,10 +282,7 @@ export function predictZellijSplitDirection(pane: ZellijPaneSnapshot): ZellijSpl
   const rows = pane.pane_rows ?? 0;
   if (columns < ZELLIJ_MIN_TERMINAL_WIDTH || rows < ZELLIJ_MIN_TERMINAL_HEIGHT) return null;
 
-  if (
-    rows * ZELLIJ_CURSOR_HEIGHT_WIDTH_RATIO > columns &&
-    rows > ZELLIJ_MIN_TERMINAL_HEIGHT * 2
-  ) {
+  if (rows * ZELLIJ_CURSOR_HEIGHT_WIDTH_RATIO > columns && rows > ZELLIJ_MIN_TERMINAL_HEIGHT * 2) {
     return "down";
   }
 
@@ -359,7 +356,9 @@ export function selectZellijPlacement(
   const zellijSplitCandidates = tabInfo.tabPanes
     .map((pane) => ({ pane, splitDirection: predictZellijSplitDirection(pane) }))
     .filter(
-      (candidate): candidate is { pane: ZellijPaneSnapshot; splitDirection: ZellijSplitDirection } =>
+      (
+        candidate,
+      ): candidate is { pane: ZellijPaneSnapshot; splitDirection: ZellijSplitDirection } =>
         candidate.splitDirection !== null &&
         canSplitZellijPane(candidate.pane, ZELLIJ_MIN_TERMINAL_WIDTH, ZELLIJ_MIN_TERMINAL_HEIGHT),
     );
@@ -1055,8 +1054,7 @@ function createHerdrSubagentSurface(name: string): string {
         const anchor = layout.panes
           .filter(
             (pane) =>
-              pane.pane_id !== parentPaneId &&
-              pane.rect.x >= parent.rect.x + parent.rect.width - 1,
+              pane.pane_id !== parentPaneId && pane.rect.x >= parent.rect.x + parent.rect.width - 1,
           )
           .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x)
           .pop();
@@ -1239,9 +1237,7 @@ function createTmuxSubagentSurface(name: string): string {
       if (parent) {
         const anchor = panes
           .filter(
-            (pane) =>
-              pane.paneId !== parentPaneId &&
-              pane.left >= parent.left + parent.width - 1,
+            (pane) => pane.paneId !== parentPaneId && pane.left >= parent.left + parent.width - 1,
           )
           .sort((a, b) => a.top - b.top || a.left - b.left)
           .pop();
@@ -1327,7 +1323,9 @@ function createSurfaceInPane(name: string, pane: string): string {
   let child: CmuxCreatedSurface | null = null;
 
   try {
-    const output = execFileSync("cmux", ["new-surface", "--pane", pane], { encoding: "utf8" }).trim();
+    const output = execFileSync("cmux", ["new-surface", "--pane", pane], {
+      encoding: "utf8",
+    }).trim();
     child = parseCmuxCreatedSurface(output, "new-surface");
     child.paneRef ??= pane;
     renameCmuxSurface(child.surface, name);
@@ -1706,19 +1704,15 @@ export function readScreen(surface: string, lines = 50): string {
   }
 
   if (backend === "herdr") {
-    return execFileSync(
-      "herdr",
-      ["pane", "read", surface, "--lines", String(Math.max(1, lines))],
-      { encoding: "utf8" },
-    );
+    return execFileSync("herdr", ["pane", "read", surface, "--lines", String(Math.max(1, lines))], {
+      encoding: "utf8",
+    });
   }
 
   if (backend === "wezterm") {
-    const raw = execFileSync(
-      "wezterm",
-      ["cli", "get-text", "--pane-id", surface],
-      { encoding: "utf8" },
-    );
+    const raw = execFileSync("wezterm", ["cli", "get-text", "--pane-id", surface], {
+      encoding: "utf8",
+    });
     return tailLines(raw, lines);
   }
 
@@ -1726,11 +1720,9 @@ export function readScreen(surface: string, lines = 50): string {
   // The ZELLIJ_PANE_ID env var doesn't reliably target other panes for dump-screen,
   // and --path may silently fail to create the file. Stdout capture is robust.
   const paneId = zellijPaneId(surface);
-  const raw = execFileSync(
-    "zellij",
-    ["action", "dump-screen", "--pane-id", paneId],
-    { encoding: "utf8" },
-  );
+  const raw = execFileSync("zellij", ["action", "dump-screen", "--pane-id", paneId], {
+    encoding: "utf8",
+  });
   return tailLines(raw, lines);
 }
 
@@ -1768,21 +1760,17 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
   }
 
   if (backend === "wezterm") {
-    const { stdout } = await execFileAsync(
-      "wezterm",
-      ["cli", "get-text", "--pane-id", surface],
-      { encoding: "utf8" },
-    );
+    const { stdout } = await execFileAsync("wezterm", ["cli", "get-text", "--pane-id", surface], {
+      encoding: "utf8",
+    });
     return tailLines(stdout, lines);
   }
 
   // Zellij 0.44+: use --pane-id flag + stdout instead of env var + temp file.
   const paneId = zellijPaneId(surface);
-  const { stdout } = await execFileAsync(
-    "zellij",
-    ["action", "dump-screen", "--pane-id", paneId],
-    { encoding: "utf8" },
-  );
+  const { stdout } = await execFileAsync("zellij", ["action", "dump-screen", "--pane-id", paneId], {
+    encoding: "utf8",
+  });
   return tailLines(stdout, lines);
 }
 
@@ -1972,7 +1960,13 @@ export async function pollForExit(
           { once: true },
         );
       });
-      await Promise.race([wait.then(() => undefined, () => undefined), abort]);
+      await Promise.race([
+        wait.then(
+          () => undefined,
+          () => undefined,
+        ),
+        abort,
+      ]);
       continue;
     }
 

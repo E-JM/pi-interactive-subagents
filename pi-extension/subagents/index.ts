@@ -29,11 +29,7 @@ import {
   readScreen,
 } from "./cmux.ts";
 
-import {
-  findLastAssistantMessage,
-  getNewEntries,
-  seedSubagentSessionFile,
-} from "./session.ts";
+import { findLastAssistantMessage, getNewEntries, seedSubagentSessionFile } from "./session.ts";
 import {
   type StatusSnapshot,
   type SubagentStatusState,
@@ -283,11 +279,7 @@ function resolveSubagentPaths(
   const rawCwd = params.cwd ?? agentDefs?.cwd ?? null;
   const cwdIsFromAgent = !params.cwd && agentDefs?.cwd != null;
   const cwdBase = cwdIsFromAgent ? getAgentConfigDir() : process.cwd();
-  const effectiveCwd = rawCwd
-    ? rawCwd.startsWith("/")
-      ? rawCwd
-      : join(cwdBase, rawCwd)
-    : null;
+  const effectiveCwd = rawCwd ? (rawCwd.startsWith("/") ? rawCwd : join(cwdBase, rawCwd)) : null;
   const localAgentDir = effectiveCwd ? join(effectiveCwd, ".pi", "agent") : null;
   const effectiveAgentDir =
     localAgentDir && existsSync(localAgentDir) ? localAgentDir : getAgentConfigDir();
@@ -436,10 +428,7 @@ function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
 }
 
 function resolveResultPresentation(
-  result: Pick<
-    SubagentResult,
-    "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage"
-  >,
+  result: Pick<SubagentResult, "exitCode" | "elapsed" | "summary" | "sessionFile" | "errorMessage">,
   name: string,
 ): string {
   const sessionRef = result.sessionFile
@@ -692,11 +681,7 @@ function buildPiPromptArgs(params: {
 
   const needsSeparator = params.taskDelivery === "artifact" && skillPrompts.length > 0;
 
-  return [
-    ...(needsSeparator ? [""] : []),
-    ...skillPrompts,
-    params.taskArg,
-  ];
+  return [...(needsSeparator ? [""] : []), ...skillPrompts, params.taskArg];
 }
 
 function activityLabel(activity: SubagentActivityState): string | undefined {
@@ -721,30 +706,39 @@ function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(
 
   if (read.ok) {
     running.activity = read.activity;
-    running.statusState = observeStatus(running.statusState, {
-      snapshot: "present",
-      updatedAt: read.activity.updatedAt,
-      sequence: read.activity.sequence,
-      phase: read.activity.phase,
-      active: read.activity.phase === "active",
-      activeScope: read.activity.activeScope,
-      activeSince: read.activity.activeSince,
-      waitingSince: read.activity.waitingSince,
-      latestEvent: read.activity.latestEvent,
-      activityLabel: activityLabel(read.activity),
-    }, observedAt);
+    running.statusState = observeStatus(
+      running.statusState,
+      {
+        snapshot: "present",
+        updatedAt: read.activity.updatedAt,
+        sequence: read.activity.sequence,
+        phase: read.activity.phase,
+        active: read.activity.phase === "active",
+        activeScope: read.activity.activeScope,
+        activeSince: read.activity.activeSince,
+        waitingSince: read.activity.waitingSince,
+        latestEvent: read.activity.latestEvent,
+        activityLabel: activityLabel(read.activity),
+      },
+      observedAt,
+    );
     return;
   }
 
-  running.statusState = observeStatus(running.statusState, {
-    snapshot: read.reason,
-    snapshotError: read.error,
-  }, observedAt);
+  running.statusState = observeStatus(
+    running.statusState,
+    {
+      snapshot: read.reason,
+      snapshotError: read.error,
+    },
+    observedAt,
+  );
 }
 
-function resolveInterruptTarget(params: { id?: string; name?: string }):
-  | { running: RunningSubagent }
-  | { error: string } {
+function resolveInterruptTarget(params: {
+  id?: string;
+  name?: string;
+}): { running: RunningSubagent } | { error: string } {
   const requestedId = params.id?.trim();
   if (requestedId) {
     const running = runningSubagents.get(requestedId);
@@ -756,7 +750,9 @@ function resolveInterruptTarget(params: { id?: string; name?: string }):
     return { error: "Provide a running subagent id or exact display name." };
   }
 
-  const matches = Array.from(runningSubagents.values()).filter((running) => running.name === requestedName);
+  const matches = Array.from(runningSubagents.values()).filter(
+    (running) => running.name === requestedName,
+  );
   if (matches.length === 1) return { running: matches[0] };
   if (matches.length === 0) {
     return { error: `No running subagent named "${requestedName}".` };
@@ -798,11 +794,12 @@ function handleSubagentInterrupt(
   const running = resolved.running;
   if (running.cli === "claude") {
     return {
-      content: [{
-        type: "text" as const,
-        text:
-          "Turn-only Escape interrupt is currently supported only for Pi-backed subagents. Claude-backed semantics have not been verified yet.",
-      }],
+      content: [
+        {
+          type: "text" as const,
+          text: "Turn-only Escape interrupt is currently supported only for Pi-backed subagents. Claude-backed semantics have not been verified yet.",
+        },
+      ],
       details: { error: "claude interrupt unsupported", id: running.id, name: running.name },
     };
   }
@@ -822,7 +819,9 @@ function handleSubagentInterrupt(
   updateWidget();
 
   return {
-    content: [{ type: "text" as const, text: `Interrupt requested for subagent "${running.name}".` }],
+    content: [
+      { type: "text" as const, text: `Interrupt requested for subagent "${running.name}".` },
+    ],
     details: { id: running.id, name: running.name, status: "interrupt_requested" },
   };
 }
@@ -878,7 +877,10 @@ function startStatusRefresh(pi: ExtensionAPI) {
   (globalThis as any)[STATUS_INTERVAL_KEY] = statusInterval;
 }
 
-function resolveResumeLaunchBehavior(params: { autoExit?: boolean }): { autoExit: boolean; interactive: boolean } {
+function resolveResumeLaunchBehavior(params: { autoExit?: boolean }): {
+  autoExit: boolean;
+  interactive: boolean;
+} {
   const autoExit = params.autoExit ?? true;
   return { autoExit, interactive: !autoExit };
 }
@@ -923,7 +925,14 @@ function startWidgetRefresh() {
  */
 async function launchSubagent(
   params: typeof SubagentParams.static,
-  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
+  ctx: {
+    sessionManager: {
+      getSessionFile(): string | null;
+      getSessionId(): string;
+      getSessionDir(): string;
+    };
+    cwd: string;
+  },
   options?: { surface?: string },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
@@ -941,7 +950,10 @@ async function launchSubagent(
   const sessionId = ctx.sessionManager.getSessionId();
   const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
 
-  const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
+  const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(
+    params,
+    agentDefs,
+  );
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
   const sessionDir = getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
 
@@ -1026,12 +1038,14 @@ async function launchSubagent(
     const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
     const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
 
-    const launchScriptName = `${(params.name || "subagent")
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, "")
-      .replace(/\s+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
+    const launchScriptName = `${
+      (params.name || "subagent")
+        .toLowerCase()
+        .replace(/[^a-z0-9\s-]/g, "")
+        .replace(/\s+/g, "-")
+        .replace(/-+/g, "-")
+        .replace(/^-|-$/g, "") || "subagent"
+    }-${id}.sh`;
     const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
 
     sendLongCommand(surface, command, {
@@ -1093,7 +1107,10 @@ async function launchSubagent(
       .replace(/\s+/g, "-")
       .replace(/-+/g, "-")
       .replace(/^-|-$/g, "");
-    const syspromptPath = join(artifactDir, `context/${spSafeName || "subagent"}-sysprompt-${spTimestamp}.md`);
+    const syspromptPath = join(
+      artifactDir,
+      `context/${spSafeName || "subagent"}-sysprompt-${spTimestamp}.md`,
+    );
     mkdirSync(dirname(syspromptPath), { recursive: true });
     writeFileSync(syspromptPath, identity, "utf8");
     parts.push(flag, shellEscape(syspromptPath));
@@ -1163,12 +1180,14 @@ async function launchSubagent(
 
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
   const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
-  const launchScriptName = `${(params.name || "subagent")
-    .toLowerCase()
-    .replace(/[^a-z0-9\s-]/g, "")
-    .replace(/\s+/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
+  const launchScriptName = `${
+    (params.name || "subagent")
+      .toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, "")
+      .replace(/\s+/g, "-")
+      .replace(/-+/g, "-")
+      .replace(/^-|-$/g, "") || "subagent"
+  }-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
   sendLongCommand(surface, command, {
     scriptPath: launchScriptFile,
@@ -1208,7 +1227,10 @@ async function launchSubagent(
  */
 const CLAUDE_SESSIONS_DIR = join(
   process.env.HOME ?? "/tmp",
-  ".pi", "agent", "sessions", "claude-code",
+  ".pi",
+  "agent",
+  "sessions",
+  "claude-code",
 );
 
 function copyClaudeSession(sentinelFile: string): string | null {
@@ -1262,23 +1284,35 @@ async function watchSubagent(
       }
 
       if (!summary) {
-        summary = result.exitCode !== 0
-          ? `Claude Code exited with code ${result.exitCode}`
-          : "Claude Code exited without output";
+        summary =
+          result.exitCode !== 0
+            ? `Claude Code exited with code ${result.exitCode}`
+            : "Claude Code exited without output";
       }
 
       // Copy Claude session transcript
       let sessionId: string | null = null;
       if (running.sentinelFile) {
         sessionId = copyClaudeSession(running.sentinelFile);
-        try { unlinkSync(running.sentinelFile); } catch {}
-        try { unlinkSync(running.sentinelFile + ".transcript"); } catch {}
+        try {
+          unlinkSync(running.sentinelFile);
+        } catch {}
+        try {
+          unlinkSync(running.sentinelFile + ".transcript");
+        } catch {}
       }
 
       closeSurface(surface);
       runningSubagents.delete(running.id);
 
-      return { name, task, summary, exitCode: result.exitCode, elapsed, ...(sessionId ? { claudeSessionId: sessionId } : {}) };
+      return {
+        name,
+        task,
+        summary,
+        exitCode: result.exitCode,
+        elapsed,
+        ...(sessionId ? { claudeSessionId: sessionId } : {}),
+      };
     }
 
     // Pi subagent result extraction
@@ -1526,19 +1560,18 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       renderCall(args, theme) {
         const partialArgs = args as Record<string, unknown>;
-        const name = typeof partialArgs.name === "string" && partialArgs.name ? partialArgs.name : "(unnamed)";
+        const name =
+          typeof partialArgs.name === "string" && partialArgs.name ? partialArgs.name : "(unnamed)";
         const task = typeof partialArgs.task === "string" ? partialArgs.task : "";
-        const agent = typeof partialArgs.agent === "string" && partialArgs.agent
-          ? theme.fg("dim", ` (${partialArgs.agent})`)
-          : "";
-        const cwdHint = typeof partialArgs.cwd === "string" && partialArgs.cwd
-          ? theme.fg("dim", ` in ${partialArgs.cwd}`)
-          : "";
-        let text =
-          "▸ " +
-          theme.fg("toolTitle", theme.bold(name)) +
-          agent +
-          cwdHint;
+        const agent =
+          typeof partialArgs.agent === "string" && partialArgs.agent
+            ? theme.fg("dim", ` (${partialArgs.agent})`)
+            : "";
+        const cwdHint =
+          typeof partialArgs.cwd === "string" && partialArgs.cwd
+            ? theme.fg("dim", ` in ${partialArgs.cwd}`)
+            : "";
+        let text = "▸ " + theme.fg("toolTitle", theme.bold(name)) + agent + cwdHint;
 
         // Show a one-line task preview. renderCall is called repeatedly as the
         // LLM generates tool arguments, so args.task grows token by token.
@@ -1602,7 +1635,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
 
       renderCall(args, theme) {
-        const target = args.id ? `${args.id}` : args.name ?? "(unknown)";
+        const target = args.id ? `${args.id}` : (args.name ?? "(unknown)");
         return new Text(
           theme.fg("accent", "▸") +
             " " +
@@ -1723,9 +1756,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       renderCall(args, theme) {
         const name = args.name ?? "Resume";
         const text =
-          "▸ " +
-          theme.fg("toolTitle", theme.bold(name)) +
-          theme.fg("dim", " — resuming session");
+          "▸ " + theme.fg("toolTitle", theme.bold(name)) + theme.fg("dim", " — resuming session");
         return new Text(text, 0, 0);
       },
 
@@ -1797,12 +1828,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           resumeMsgFile = join(
             artifactDir,
             "subagent-resume",
-            `${name
-              .toLowerCase()
-              .replace(/[^a-z0-9\s-]/g, "")
-              .replace(/\s+/g, "-")
-              .replace(/-+/g, "-")
-              .replace(/^-|-$/g, "") || "resume"}-${msgTimestamp}.md`,
+            `${
+              name
+                .toLowerCase()
+                .replace(/[^a-z0-9\s-]/g, "")
+                .replace(/\s+/g, "-")
+                .replace(/-+/g, "-")
+                .replace(/^-|-$/g, "") || "resume"
+            }-${msgTimestamp}.md`,
           );
           mkdirSync(dirname(resumeMsgFile), { recursive: true });
           writeFileSync(resumeMsgFile, params.message, "utf8");
@@ -1812,7 +1845,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Build env prefix — propagate PI_CODING_AGENT_DIR for config isolation
         const resumeEnvParts: string[] = [];
         if (process.env.PI_CODING_AGENT_DIR) {
-          resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(process.env.PI_CODING_AGENT_DIR)}`);
+          resumeEnvParts.push(
+            `PI_CODING_AGENT_DIR=${shellEscape(process.env.PI_CODING_AGENT_DIR)}`,
+          );
         }
         resumeEnvParts.push(`PI_SUBAGENT_NAME=${shellEscape(name)}`);
         resumeEnvParts.push(`PI_SUBAGENT_SESSION=${shellEscape(params.sessionPath)}`);
@@ -1827,12 +1862,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
-          `${name
-            .toLowerCase()
-            .replace(/[^a-z0-9\s-]/g, "")
-            .replace(/\s+/g, "-")
-            .replace(/-+/g, "-")
-            .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
+          `${
+            name
+              .toLowerCase()
+              .replace(/[^a-z0-9\s-]/g, "")
+              .replace(/\s+/g, "-")
+              .replace(/-+/g, "-")
+              .replace(/^-|-$/g, "") || "resume"
+          }-resume-${Date.now()}.sh`,
         );
         sendLongCommand(surface, command, {
           scriptPath: launchScriptFile,
@@ -1892,7 +1929,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             }
 
             const allEntries = getNewEntries(params.sessionPath, entryCountBefore);
-            const summary = findLastAssistantMessage(allEntries) ??
+            const summary =
+              findLastAssistantMessage(allEntries) ??
               (result.errorMessage
                 ? `Subagent error: ${result.errorMessage}`
                 : result.exitCode !== 0
@@ -2002,9 +2040,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const bgFn = failed
           ? (text: string) => theme.bg("toolErrorBg", text)
           : (text: string) => theme.bg("toolSuccessBg", text);
-        const icon = failed
-          ? theme.fg("error", "✗")
-          : theme.fg("success", "✓");
+        const icon = failed ? theme.fg("error", "✗") : theme.fg("success", "✓");
         const status = errorMessage
           ? "failed (provider/agent error)"
           : failed
