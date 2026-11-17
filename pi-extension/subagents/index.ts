@@ -1085,6 +1085,13 @@ async function launchSubagent(
   const parts: string[] = ["pi"];
   parts.push("--session", shellEscape(subagentSessionFile));
 
+  // herdr's `pane read` cannot see alt-screen transcript content of fullscreen
+  // background panes, which breaks the screen-reading crash-detection fallback
+  // in pollForExit, so force regular mode there.
+  if (getMuxBackend() === "herdr") {
+    parts.push("--tui-mode", "regular");
+  }
+
   const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
   parts.push("-e", shellEscape(subagentDonePath));
 
@@ -1798,6 +1805,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Build pi resume command
         const parts = ["pi", "--session", shellEscape(params.sessionPath)];
+
+        // Keep resumed panes readable on herdr (see launchSubagent).
+        if (getMuxBackend() === "herdr") {
+          parts.push("--tui-mode", "regular");
+        }
 
         // Load subagent-done extension so the agent can self-terminate if needed
         const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");

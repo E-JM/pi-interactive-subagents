@@ -2,7 +2,7 @@
  * Integration test harness for pi-interactive-subagents.
  *
  * Provides utilities to:
- * - Detect available mux backends (cmux, tmux, zellij)
+ * - Detect available mux backends (cmux, tmux, zellij, herdr)
  * - Create isolated test environments with test agent definitions
  * - Start real pi sessions in mux surfaces
  * - Poll for file creation and screen output
@@ -17,6 +17,7 @@ import {
   rmSync,
   existsSync,
   readFileSync,
+  writeFileSync,
   unlinkSync,
 } from "node:fs";
 import { join, resolve, dirname } from "node:path";
@@ -89,7 +90,7 @@ export function getAvailableBackends(): MuxBackend[] {
   const backends: MuxBackend[] = [];
   const orig = process.env.PI_SUBAGENT_MUX;
 
-  for (const backend of ["cmux", "tmux", "zellij"] as MuxBackend[]) {
+  for (const backend of ["cmux", "tmux", "zellij", "herdr"] as MuxBackend[]) {
     process.env.PI_SUBAGENT_MUX = backend;
     try {
       if (getMuxBackend() === backend) backends.push(backend);
@@ -133,6 +134,18 @@ export function getFocusedSurface(backend: MuxBackend): string | null {
   if (backend === "cmux") {
     const info = execFileSync("cmux", ["identify", "--json"], { encoding: "utf8" });
     return parseCmuxFocusedSnapshotFromJson(info)?.surfaceRef ?? null;
+  }
+
+  if (backend === "herdr") {
+    try {
+      const output = execFileSync("herdr", ["pane", "list"], { encoding: "utf8" });
+      const panes = JSON.parse(output)?.result?.panes;
+      if (!Array.isArray(panes)) return null;
+      const focused = panes.find((pane: any) => pane?.focused === true);
+      return focused?.pane_id ?? null;
+    } catch {
+      return null;
+    }
   }
 
   if (backend === "tmux") {
@@ -192,6 +205,27 @@ export interface TestEnv {
 }
 
 /**
+ * Copy test agent definitions into the project-local agents dir.
+ * When PI_TEST_MODEL is set, rewrite each agent's `model:` frontmatter so
+ * child subagents run on the same (available) model as the parent session.
+ */
+function copyTestAgents(agentsDir: string): void {
+  if (!existsSync(TEST_AGENTS_SRC)) return;
+  for (const file of readdirSync(TEST_AGENTS_SRC)) {
+    if (!file.endsWith(".md")) continue;
+    const src = join(TEST_AGENTS_SRC, file);
+    const dest = join(agentsDir, file);
+    const model = process.env.PI_TEST_MODEL;
+    if (!model) {
+      cpSync(src, dest);
+      continue;
+    }
+    const content = readFileSync(src, "utf8").replace(/^(model:).*$/m, `$1 ${model}`);
+    writeFileSync(dest, content, "utf8");
+  }
+}
+
+/**
  * Create an isolated test environment with test agent definitions.
  * The temp dir has `.pi/agents/` containing copies of all test agents.
  */
@@ -200,14 +234,7 @@ export function createTestEnv(backend: MuxBackend): TestEnv {
   const agentsDir = join(dir, ".pi", "agents");
   mkdirSync(agentsDir, { recursive: true });
 
-  // Copy test agent definitions into the project-local agents dir
-  if (existsSync(TEST_AGENTS_SRC)) {
-    for (const file of readdirSync(TEST_AGENTS_SRC)) {
-      if (file.endsWith(".md")) {
-        cpSync(join(TEST_AGENTS_SRC, file), join(agentsDir, file));
-      }
-    }
-  }
+  copyTestAgents(agentsDir);
 
   return { dir, backend, surfaces: [], tempFiles: [] };
 }
@@ -276,6 +303,10 @@ export function startPi(
   const model = opts?.model ?? TEST_MODEL;
   const extra = opts?.extraArgs ?? "";
 
+  // herdr's `pane read` cannot see alt-screen transcript content of fullscreen
+  // background panes, so screen-based assertions need regular mode there.
+  const tuiMode = getMuxBackend() === "herdr" ? "--tui-mode regular" : "";
+
   // Force pi to load the working-tree extension (not an installed pi-package
   // snapshot). `-ne` disables extension auto-discovery, `-e <path>` loads the
   // current branch's source directly. Without this, the tests silently run
@@ -286,6 +317,7 @@ export function startPi(
     `-ne`,
     `-e ${shellEscape(EXTENSION_SOURCE)}`,
     `--model ${shellEscape(model)}`,
+    tuiMode,
     extra,
     shellEscape(task),
   ]

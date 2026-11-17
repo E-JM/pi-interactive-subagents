@@ -63,39 +63,43 @@ for (const backend of backends) {
       restoreBackend(prevMux);
     });
 
-    it("keeps focus on the active surface while creating and targeting subagent surfaces", async () => {
-      const anchor = createTrackedSurfaceSplit(env, "focus-anchor", "right");
-      await sleep(1000);
+    // Focus assertions need a focus-by-id API; zellij/herdr only expose
+    // direction-relative focus navigation, so skip there.
+    (backend === "cmux" || backend === "tmux" ? it : it.skip)(
+      "keeps focus on the active surface while creating and targeting subagent surfaces",
+      async () => {
+        const anchor = createTrackedSurfaceSplit(env, "focus-anchor", "right");
+        await sleep(1000);
 
-      focusSurface(backend, anchor);
-      await waitForFocusedSurface(backend, anchor, 10_000);
+        focusSurface(backend, anchor);
+        await waitForFocusedSurface(backend, anchor, 10_000);
 
-      const childA = createTrackedSurface(env, "focus-child-a");
-      await sleep(FOCUS_TEST_SHELL_READY_DELAY_MS);
-      assert.equal(getFocusedSurface(backend), anchor);
+        const childA = createTrackedSurface(env, "focus-child-a");
+        await sleep(FOCUS_TEST_SHELL_READY_DELAY_MS);
+        assert.equal(getFocusedSurface(backend), anchor);
 
-      const childB = createTrackedSurface(env, "focus-child-b");
-      await sleep(FOCUS_TEST_SHELL_READY_DELAY_MS);
-      assert.equal(getFocusedSurface(backend), anchor);
+        const childB = createTrackedSurface(env, "focus-child-b");
+        await sleep(FOCUS_TEST_SHELL_READY_DELAY_MS);
+        assert.equal(getFocusedSurface(backend), anchor);
 
-      if (backend === "cmux") {
-        const paneA = getSurfacePane(backend, childA);
-        const paneB = getSurfacePane(backend, childB);
-        assert.ok(paneA, `Expected pane ref for ${childA}`);
-        assert.ok(paneB, `Expected pane ref for ${childB}`);
-        assert.equal(paneB, paneA);
-      }
+        if (backend === "cmux") {
+          const paneA = getSurfacePane(backend, childA);
+          const paneB = getSurfacePane(backend, childB);
+          assert.ok(paneA, `Expected pane ref for ${childA}`);
+          assert.ok(paneB, `Expected pane ref for ${childB}`);
+          assert.equal(paneB, paneA);
+        }
 
-      const markerA = uniqueId();
-      const markerB = uniqueId();
-      sendCommand(childA, `echo "FOCUS_A_${markerA}"`);
-      sendCommand(childB, `echo "FOCUS_B_${markerB}"`);
+        const markerA = uniqueId();
+        const markerB = uniqueId();
+        sendCommand(childA, `echo "FOCUS_A_${markerA}"`);
+        sendCommand(childB, `echo "FOCUS_B_${markerB}"`);
 
-      await Promise.all([
-        waitForScreen(childA, new RegExp(`FOCUS_A_${markerA}`), 20_000, 50),
-        waitForScreen(childB, new RegExp(`FOCUS_B_${markerB}`), 20_000, 50),
-      ]);
-      assert.equal(getFocusedSurface(backend), anchor);
+        await Promise.all([
+          waitForScreen(childA, new RegExp(`FOCUS_A_${markerA}`), 20_000, 50),
+          waitForScreen(childB, new RegExp(`FOCUS_B_${markerB}`), 20_000, 50),
+        ]);
+        assert.equal(getFocusedSurface(backend), anchor);
     });
 
     it("creates a surface, sends a command, reads output, and closes it", async () => {

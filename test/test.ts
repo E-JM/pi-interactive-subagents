@@ -21,6 +21,8 @@ import {
   shellEscape,
   isCmuxAvailable,
   isWezTermAvailable,
+  isHerdrAvailable,
+  parseHerdrPaneId,
   parseCmuxFocusedSnapshot,
   parseCmuxFocusedSnapshotFromJson,
   parseCmuxJson,
@@ -2373,6 +2375,40 @@ describe("cmux.ts", () => {
     it("returns boolean based on WEZTERM_UNIX_SOCKET", () => {
       const result = isWezTermAvailable();
       assert.equal(typeof result, "boolean");
+    });
+  });
+
+  describe("isHerdrAvailable", () => {
+    it("returns boolean based on herdr env markers", () => {
+      const result = isHerdrAvailable();
+      assert.equal(typeof result, "boolean");
+    });
+  });
+
+  describe("parseHerdrPaneId", () => {
+    it("extracts pane ids from pane split output", () => {
+      const output = JSON.stringify({
+        id: "cli:pane:split",
+        result: { pane: { pane_id: "w1:pB", tab_id: "w1:t1" }, type: "pane_info" },
+      });
+      assert.equal(parseHerdrPaneId(output, "pane split"), "w1:pB");
+    });
+
+    it("extracts pane ids from tab create output", () => {
+      const output = JSON.stringify({
+        id: "cli:tab:create",
+        result: { root_pane: { pane_id: "w2:p1", tab_id: "w2:t1" }, tab: { tab_id: "w2:t1" }, type: "tab_created" },
+      });
+      assert.equal(parseHerdrPaneId(output, "tab create"), "w2:p1");
+    });
+
+    it("throws on malformed output", () => {
+      assert.throws(() => parseHerdrPaneId("not json", "pane split"), /Unexpected herdr/);
+      assert.throws(
+        () => parseHerdrPaneId(JSON.stringify({ result: { pane: {} } }), "pane split"),
+        /Unexpected herdr/,
+      );
+      assert.throws(() => parseHerdrPaneId("", "tab create"), /Unexpected herdr/);
     });
   });
 });

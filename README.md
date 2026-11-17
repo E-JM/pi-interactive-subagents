@@ -56,7 +56,7 @@ If your shell startup is slow and subagent commands sometimes get dropped before
 export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500
 ```
 
-Subagent panes are created without stealing keyboard focus (cmux, tmux). Launch commands target child surfaces by explicit ID, so focus and command delivery are independent. Note: the `interactive` option controls parent status notifications, not terminal focus.
+Subagent panes are created without stealing keyboard focus (cmux, tmux, herdr). Launch commands target child surfaces by explicit ID, so focus and command delivery are independent. On herdr, subagents split the parent pane just like on tmux — each split is labeled with the subagent name, and herdr detects the child agent and shows its live status. Because herdr's `pane read` cannot see the transcript of fullscreen (alt-screen) background panes, Pi-backed subagents on herdr launch with `--tui-mode regular` so their output stays readable for completion detection. Note: the `interactive` option controls parent status notifications, not terminal focus.
 
 ## What's Included
 
@@ -453,11 +453,11 @@ spawning: false
 
 ## Tools Widget
 
-Every sub-agent session displays a compact tools widget showing available and denied tools. Toggle with `Ctrl+J`:
+Every sub-agent session displays a compact tools widget showing available and denied tools. Toggle with `Ctrl+Shift+J`:
 
 ```
-[scout] — 12 tools · 4 denied  (Ctrl+J)              ← collapsed
-[scout] — 12 available  (Ctrl+J to collapse)          ← expanded
+[scout] — 12 tools · 4 denied  (Ctrl+Shift+J)              ← collapsed
+[scout] — 12 available  (Ctrl+Shift+J to collapse)          ← expanded
   read, bash, edit, write, todo, ...
   denied: subagent, subagents_list, ...
 ```
@@ -472,6 +472,7 @@ Every sub-agent session displays a compact tools widget showing available and de
   - [tmux](https://github.com/tmux/tmux)
   - [zellij](https://zellij.dev)
   - [WezTerm](https://wezfurlong.org/wezterm/)
+  - [herdr](https://herdr.dev)
 
 ```bash
 cmux pi
@@ -480,13 +481,15 @@ tmux new -A -s pi 'pi'
 # or
 zellij --session pi   # then run: pi
 # or
+herdr                 # then run: pi
+# or
 # just run pi inside WezTerm
 ```
 
 Optional backend override:
 
 ```bash
-export PI_SUBAGENT_MUX=cmux   # or tmux, zellij, wezterm
+export PI_SUBAGENT_MUX=cmux   # or tmux, zellij, wezterm, herdr
 ```
 
 ---
