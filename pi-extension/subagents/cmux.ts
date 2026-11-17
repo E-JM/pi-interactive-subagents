@@ -464,7 +464,7 @@ function createZellijTab(name: string): string {
     try {
       zellijActionSync(["close-tab", "--tab-id", String(tabId)]);
     } catch {
-      // Best effort cleanup for tabs created before post-creation inspection failed.
+      // Best effort.
     }
     throw error;
   }
@@ -766,8 +766,6 @@ function createCmuxSplitSurface(
   }
 }
 
-// ── herdr helpers ──
-
 /** Extract the pane id from a herdr CLI JSON envelope (`pane split` / `tab create` output). */
 export function parseHerdrPaneId(output: string, context: string): string {
   const parsed = parseCmuxJson(output);
@@ -777,12 +775,6 @@ export function parseHerdrPaneId(output: string, context: string): string {
   }
   return paneId;
 }
-
-// ── herdr balanced subagent layout ──
-//
-// Goal layout: parent (main agent) at a fixed width on the left, every
-// subagent pane sharing the remaining width equally. Repeatedly splitting the
-// parent (the old behavior) left the main agent with a sliver of the tab.
 
 export interface HerdrRect {
   x: number;
@@ -828,10 +820,7 @@ function readHerdrLayout(paneId?: string): HerdrLayout | null {
   }
 }
 
-/**
- * Tracked herdr subagent panes, kept on globalThis via Symbol.for so the list
- * survives /reload (same pattern as the widget timers in index.ts).
- */
+/** Tracked herdr subagent panes; globalThis + Symbol.for so it survives /reload. */
 const HERDR_SUBAGENT_PANES_KEY = Symbol.for("pi-subagents/herdr-subagent-panes");
 
 function herdrSubagentPaneList(): string[] {
@@ -872,15 +861,7 @@ function herdrParentRatio(): number {
 /** Ratio deltas below this are treated as already-balanced (avoids rounding churn). */
 const HERDR_RESIZE_EPSILON = 0.01;
 
-/**
- * One `herdr pane resize` step.
- *
- * herdr resizes move the divider on the given side of `paneId` by `amount`
- * (a ratio delta). Anchoring matters: subagent cell i's *right* divider is the
- * split between it and the rest of the row, so growing cell i anchors on cell
- * i (`direction: "right"`), while shrinking it anchors on its right neighbor
- * (`direction: "left"`) — the same divider, approached from the other side.
- */
+/** One `herdr pane resize` step: move the divider on the pane's `direction` side by `amount` (a ratio delta). */
 export interface HerdrResizeOp {
   paneId: string;
   direction: "left" | "right";
@@ -888,15 +869,10 @@ export interface HerdrResizeOp {
 }
 
 /**
- * Plan the resize ops that arrange the tab as: parent pane at `parentRatio`
- * of the width on the left, and every full-height pane to its right (subagent
- * panes) sharing the remaining width equally. Pure — no CLI calls.
- *
- * The layout is a binary split tree; herdr resizes move one divider by a
- * ratio delta, so each split is targeted independently in ratio space (safe
- * at any nesting depth because moving an outer split changes inner regions'
- * absolute widths but not their ratios). Other panes (left of the parent or
- * partial-height) are frozen at their current width.
+ * Plan resizes that lay the tab out as: parent at `parentRatio` width on the
+ * left, every full-height pane to its right sharing the rest equally. Each
+ * split's ratio is targeted independently, so nesting depth doesn't matter.
+ * Panes left of the parent or partial-height are frozen. Pure — no CLI calls.
  */
 export function planHerdrRebalance(
   layout: HerdrLayout,
@@ -933,7 +909,7 @@ export function planHerdrRebalance(
 
   const parentTarget = parentRatio * total.width;
   const remaining = total.width - parentTarget - frozenSum;
-  if (cells.length > 0 && !(remaining > 5)) return ops; // cannot fit; don't fight the layout
+  if (cells.length > 0 && !(remaining > 5)) return ops; // can't fit; leave the layout alone
   const cellTarget = cells.length > 0 ? remaining / cells.length : 0;
 
   const targetWidth = (pane: HerdrLayoutPane): number => {
@@ -948,7 +924,7 @@ export function planHerdrRebalance(
     pane.rect.x + pane.rect.width <= rect.x + rect.width + 1.5 &&
     pane.rect.y + pane.rect.height <= rect.y + rect.height + 1.5;
 
-  // Wider (outer) splits first so anchors sit next to the divider being moved.
+  // Outermost splits first.
   const rightSplits = layout.splits.filter((split) => split.direction === "right");
   const splits = [...rightSplits].sort(
     (a, b) => b.rect.width * b.rect.height - a.rect.width * a.rect.height,
@@ -958,13 +934,7 @@ export function planHerdrRebalance(
   const overlapsY = (anchor: HerdrLayoutPane, rect: HerdrRect): boolean =>
     anchor.rect.y < rect.y + rect.height + 1.5 && anchor.rect.y + anchor.rect.height > rect.y - 1.5;
 
-  /**
-   * Legacy layouts (repeatedly splitting the parent) can stack two splits'
-   * dividers at the same x, making a resize of the anchor pane ambiguous —
-   * herdr may move either one. Bail on such layouts: guessing can shrink the
-   * parent instead of growing it. Clean layouts created by this code never
-   * collide (each divider is separated by at least one full cell).
-   */
+  // Coincident dividers make a resize ambiguous (see guard below) — bail.
   let ambiguous = false;
 
   for (const split of splits) {
@@ -995,18 +965,17 @@ export function planHerdrRebalance(
     let anchor: HerdrLayoutPane;
     let grow: boolean;
     if (delta > 0) {
-      // Grow the left subtree: move the divider right, anchored on the leaf
-      // beside it (rightmost pane on the left side).
+      // Grow: move the divider right, anchored on the pane beside it.
       anchor = [...leftLeaves].sort((a, b) => b.rect.x - a.rect.x)[0];
       grow = true;
     } else {
-      // Shrink the left subtree: same divider, approached from the right side.
+      // Shrink: same divider, from the right side.
       anchor = [...rightLeaves].sort((a, b) => a.rect.x - b.rect.x)[0];
       grow = false;
     }
 
-    // The anchor must sit directly against this divider, and no other split's
-    // divider may coincide with it at the anchor's position.
+    // Skip if another split's divider coincides with this one — herdr could
+    // move either one. Only happens in legacy layouts this code never creates.
     const anchorEdge = grow ? anchor.rect.x + anchor.rect.width : anchor.rect.x;
     if (Math.abs(anchorEdge - dividerX) > 1.5) continue;
     for (const other of rightSplits) {
@@ -1047,19 +1016,15 @@ function applyHerdrResizeOps(ops: HerdrResizeOp[]): void {
         { encoding: "utf8" },
       );
     } catch {
-      // Best effort — herdr clamps ratios and can refuse moves on tiny panes.
+      // Best effort — herdr clamps ratios and refuses tiny moves.
     }
   }
 }
 
 /**
- * Bring the parent pane and every full-height subagent pane back to the
- * balanced layout (parent fixed width, subagents equal width). Best effort:
- * layout or resize failures never block spawning.
- *
- * Runs up to three plan→apply passes against a fresh layout each time: ratio
- * rounding and herdr's ratio clamps can leave small residuals after one pass,
- * and the second pass absorbs them (each pass strictly reduces the imbalance).
+ * Rebalance: parent fixed width, subagents equal width. Runs up to three
+ * plan→apply passes against a fresh layout to absorb rounding and clamp
+ * residuals. Best effort — never blocks spawning.
  */
 function rebalanceHerdrSubagentLayout(parentPaneId: string): void {
   for (let pass = 0; pass < 3; pass++) {
@@ -1072,17 +1037,13 @@ function rebalanceHerdrSubagentLayout(parentPaneId: string): void {
 }
 
 /**
- * Create a herdr surface for a subagent, keeping the tab layout balanced:
- * the parent (main agent) keeps its width on the left, and each new subagent
- * splits the rightmost subagent pane so all subagent panes stay equal width.
- * Falls back to splitting the parent for the first subagent.
+ * Create a herdr subagent surface: the parent keeps its width, new subagents
+ * split the rightmost subagent pane so all subagent panes stay equal width.
  */
 function createHerdrSubagentSurface(name: string): string {
   const parentPaneId = process.env.HERDR_PANE_ID;
 
-  // Anchor on the rightmost full-height pane to the right of the parent
-  // (geometric, so it self-heals after /reload); prune tracked panes the user
-  // closed. Falls back to splitting the parent for the first subagent.
+  // Anchor on the rightmost pane right of the parent (self-heals after /reload).
   let anchorPaneId = parentPaneId ?? undefined;
   if (parentPaneId) {
     const layout = readHerdrLayout(parentPaneId);
@@ -1111,13 +1072,6 @@ function createHerdrSubagentSurface(name: string): string {
   }
   return paneId;
 }
-
-// ── tmux balanced subagent layout ──
-// Same goal as herdr: parent at a fixed width on the left, every subagent
-// pane sharing the remaining width equally. tmux resizes take absolute
-// column counts (`resize-pane -x`), so no ratio math is needed — each op
-// pins the divider on that pane's right edge, applied parent first, then
-// cells left to right.
 
 export interface TmuxPaneGeometry {
   paneId: string;
@@ -1163,10 +1117,7 @@ function readTmuxPaneGeometry(targetPaneId?: string): TmuxPaneGeometry[] {
   }
 }
 
-/**
- * Tracked tmux subagent panes, kept on globalThis via Symbol.for so the list
- * survives /reload (same pattern as the herdr tracker).
- */
+/** Tracked tmux subagent panes; globalThis + Symbol.for so it survives /reload. */
 const TMUX_SUBAGENT_PANES_KEY = Symbol.for("pi-subagents/tmux-subagent-panes");
 
 function tmuxSubagentPaneList(): string[] {
@@ -1201,12 +1152,8 @@ export interface TmuxResizeOp {
 }
 
 /**
- * Plan resize ops that arrange the window as: parent pane at `parentRatio`
- * of the width on the left, and every full-height pane to its right sharing
- * the remaining columns equally. Pure — no CLI calls. Ops are applied parent
- * first, then cells left to right: each `-x` pins the divider on that pane's
- * right edge, so later ops only redistribute columns further right. Panes
- * already within one column of target are skipped to avoid churn.
+ * Plan absolute-width resizes: parent at `parentRatio` of the window, every
+ * full-height pane to its right sharing the rest equally. Pure — no CLI calls.
  */
 export function planTmuxRebalance(
   panes: TmuxPaneGeometry[],
@@ -1255,16 +1202,14 @@ function applyTmuxResizeOps(ops: TmuxResizeOp[]): void {
         encoding: "utf8",
       });
     } catch {
-      // Best effort — tmux clamps to minimum pane sizes and can refuse moves.
+      // Best effort — tmux clamps to minimum pane sizes.
     }
   }
 }
 
 /**
- * Bring the parent pane and all full-height subagent panes back to the
- * balanced layout (parent fixed width, subagents equal width). Best effort:
- * layout or resize failures never block spawning. A second pass absorbs any
- * residual drift from tmux's size clamps.
+ * Rebalance: parent fixed width, subagents equal width. Second pass absorbs
+ * any drift from tmux's size clamps. Best effort — never blocks spawning.
  */
 function rebalanceTmuxSubagentLayout(parentPaneId: string): void {
   for (let pass = 0; pass < 2; pass++) {
@@ -1277,17 +1222,13 @@ function rebalanceTmuxSubagentLayout(parentPaneId: string): void {
 }
 
 /**
- * Create a tmux surface for a subagent, keeping the window layout balanced:
- * the parent (main agent) keeps its width on the left, and each new subagent
- * splits the rightmost subagent pane so all subagent panes stay equal width.
- * Falls back to splitting the parent for the first subagent.
+ * Create a tmux subagent surface: the parent keeps its width, new subagents
+ * split the rightmost subagent pane so all subagent panes stay equal width.
  */
 function createTmuxSubagentSurface(name: string): string {
   const parentPaneId = process.env.TMUX_PANE;
 
-  // Anchor on the rightmost full-height pane to the right of the parent
-  // (geometric, so it self-heals after /reload); prune tracked panes the
-  // user closed. Falls back to splitting the parent for the first subagent.
+  // Anchor on the rightmost pane right of the parent (self-heals after /reload).
   let anchorPaneId = parentPaneId ?? undefined;
   if (parentPaneId) {
     const panes = readTmuxPaneGeometry(parentPaneId);
@@ -1372,9 +1313,7 @@ export function createSurface(name: string): string {
     return createTmuxSubagentSurface(name);
   }
 
-  // On wezterm, target the parent pi's pane so splits follow the agent, not
-  // the user's focus (wezterm exposes no pane-position API for a balanced
-  // layout yet).
+  // wezterm: split the parent (no pane-position API for a balanced layout yet).
   return createSurfaceSplit(name, "right", process.env.WEZTERM_PANE);
 }
 
@@ -1999,11 +1938,8 @@ export async function pollForExit(
     const elapsed = Math.floor((Date.now() - start) / 1000);
     options.onTick?.(elapsed);
 
-    // herdr: while pi is in a detected working turn, block on the agent's
-    // state instead of blind sampling — `agent wait` returns the moment pi
-    // goes idle (turn finished), gets blocked (needs input), or disappears
-    // (exited/crashed). Any other state (booting shell, idle pi) falls through
-    // to the plain sleep so already-settled agents can't cause a hot loop.
+    // herdr: block on `agent wait` instead of blind sampling — it returns as
+    // soon as the agent settles (idle/blocked/gone), avoiding a hot loop.
     if (getMuxBackend() === "herdr" && (await isHerdrAgentWorking(surface))) {
       const wait = execFileAsync(
         "herdr",

@@ -57,9 +57,8 @@ import {
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
 
-// Survive /reload: clear timers and abort poll loops from the previous module load.
-// /reload re-imports this file, giving fresh module-level state, but closures from
-// the old module keep running. See https://github.com/HazAT/pi-interactive-subagents/issues/5
+// Survive /reload: closures from the previous module load keep running, so
+// clear its timers and abort its poll loops. See .../issues/5
 const WIDGET_INTERVAL_KEY = Symbol.for("pi-subagents/widget-interval");
 const STATUS_INTERVAL_KEY = Symbol.for("pi-subagents/status-interval");
 const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
@@ -448,10 +447,8 @@ function resolveResultPresentation(
     : "";
 
   if (result.errorMessage) {
-    // Auto-retry exhausted or other agent-loop error. The subagent did not
-    // produce a usable result — surface the underlying provider/network
-    // failure so the orchestrator can decide whether to retry, resume, or
-    // change approach instead of silently treating the run as completed.
+    // Auto-retry exhausted: surface the provider/network failure instead of
+    // silently treating the run as completed.
     return (
       `Sub-agent "${name}" failed after ${formatElapsed(result.elapsed)} ` +
       `(provider/agent error — auto-retry exhausted).\n\n` +
@@ -518,8 +515,6 @@ interface RunningSubagent {
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
 
-// ── Widget management ──
-
 /** Latest ExtensionContext from session_start, used for widget updates. */
 let latestCtx: ExtensionContext | null = null;
 
@@ -551,8 +546,7 @@ function borderLine(left: string, right: string, width: number): string {
   const contentWidth = Math.max(0, width - 2); // space inside the two │ chars
   const rightVis = visibleWidth(right);
 
-  // If the status chunk alone is too wide, prefer preserving it in compact form
-  // rather than overflowing the terminal.
+  // Prefer a compact right chunk over overflowing the terminal.
   if (rightVis >= contentWidth) {
     const truncRight = truncateToWidth(right, contentWidth);
     const rightPad = Math.max(0, contentWidth - visibleWidth(truncRight));
@@ -575,7 +569,6 @@ function borderTop(title: string, info: string, width: number): string {
   if (width === 1) return `${ACCENT}╭${RST}`;
 
   // ╭─ Title ───...─── info ─╮
-  // overhead: ╭─ (2) + space around title (2) + space around info (2) + ─╮ (2) = but we simplify
   const inner = Math.max(0, width - 2); // inside ╭ and ╮
   const titlePart = `─ ${title} `;
   const infoPart = ` ${info} ─`;
@@ -859,10 +852,8 @@ function startStatusRefresh(pi: ExtensionAPI) {
       }
       running.statusState = nextState;
 
-      // Interactive subagents (long-running, user-driven) intentionally don't
-      // wake the parent session on stalled/recovered transitions — the user is
-      // working in the subagent's pane, and a steer message here would burn an
-      // orchestrator turn on a no-op "still waiting" ping. Widget still updates.
+      // Interactive subagents don't wake the parent on stalled/recovered
+      // transitions — the user is already in the pane; widget still updates.
       if (transition && !running.interactive) {
         transitionLines.push(formatTransitionLine(running.name, snapshot, transition));
       }
@@ -954,9 +945,7 @@ async function launchSubagent(
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
   const sessionDir = getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
 
-  // Generate a deterministic session file path for this subagent.
-  // This eliminates race conditions when multiple agents launch simultaneously —
-  // each agent knows exactly which file is theirs.
+  // Deterministic path so simultaneous launches never race on the session file.
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 23) + "Z";
   const uuid = [
     id,
@@ -989,9 +978,8 @@ async function launchSubagent(
   mkdirSync(dirname(activityFile), { recursive: true });
   const { inheritsConversationContext } = launchBehavior;
 
-  // Build the task message
-  // Only full-context fork mode inherits prior conversation state.
-  // Blank-session modes need the wrapper instructions and artifact-backed handoff.
+  // Fork mode inherits the conversation; blank-session modes get wrapper
+  // instructions and artifact-backed handoff.
   const modeHint = agentDefs?.autoExit
     ? "Complete your task autonomously."
     : "Complete your task. When finished, call the subagent_done tool. The user can interact with you at any time.";
@@ -1006,7 +994,6 @@ async function launchSubagent(
   const fullTask = inheritsConversationContext
     ? params.task
     : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
-  // ── Claude Code CLI path ──
   if (agentDefs?.cli === "claude") {
     const sentinelFile = `/tmp/pi-claude-${id}-done`;
     const pluginDir = join(SUBAGENTS_DIR, "plugin");
@@ -1033,8 +1020,7 @@ async function launchSubagent(
       cmdParts.push("--resume", shellEscape(params.resumeSessionId));
     }
 
-    // Always pass the task as the prompt — even for resumed sessions,
-    // the caller's task is the follow-up instruction.
+    // For resumed sessions the task doubles as the follow-up instruction.
     cmdParts.push(shellEscape(params.task));
 
     const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
@@ -1079,15 +1065,11 @@ async function launchSubagent(
     return running;
   }
 
-  // ── Pi CLI path ──
-
-  // Build pi command
   const parts: string[] = ["pi"];
   parts.push("--session", shellEscape(subagentSessionFile));
 
-  // herdr's `pane read` cannot see alt-screen transcript content of fullscreen
-  // background panes, which breaks the screen-reading crash-detection fallback
-  // in pollForExit, so force regular mode there.
+  // herdr's `pane read` can't see alt-screen panes, which breaks
+  // pollForExit's crash detection, so force regular mode there.
   if (getMuxBackend() === "herdr") {
     parts.push("--tui-mode", "regular");
   }
@@ -1100,9 +1082,8 @@ async function launchSubagent(
     parts.push("--model", shellEscape(model));
   }
 
-  // Pass agent body as system prompt via file to avoid shell escaping issues
-  // with multiline content. Pi's --append-system-prompt and --system-prompt
-  // auto-detect file paths and read their contents.
+  // Pi auto-detects file paths in --system-prompt/--append-system-prompt, so
+  // pass the identity as a file to dodge shell escaping of multiline content.
   if (identityInSystemPrompt && identity) {
     const flag = systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt";
     const spTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
@@ -1126,8 +1107,7 @@ async function launchSubagent(
   // Build env prefix: denied tools + subagent identity + config dir propagation
   const envParts: string[] = [];
 
-  // If the target cwd has its own .pi/agent/, use that as the config root.
-  // Otherwise propagate the current/global agent dir.
+  // Prefer the target cwd's own .pi/agent/ as config root when present.
   if (localAgentDir && existsSync(localAgentDir)) {
     envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(localAgentDir)}`);
   } else if (process.env.PI_CODING_AGENT_DIR) {
@@ -1150,10 +1130,8 @@ async function launchSubagent(
   envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
   const envPrefix = envParts.join(" ") + " ";
 
-  // Pass task and skill prompts to the sub-agent.
-  // Only full-context fork mode gets a direct task argument because it already
-  // inherits the parent conversation. Blank-session modes use artifact-backed
-  // handoff so the wrapper instructions arrive as the initial user message.
+  // Fork mode gets the task as a direct arg; blank-session modes use
+  // artifact-backed handoff so instructions arrive as the first message.
   let taskArg: string;
   if (launchBehavior.taskDelivery === "direct") {
     taskArg = fullTask;
@@ -1180,8 +1158,7 @@ async function launchSubagent(
     parts.push(shellEscape(promptArg));
   }
 
-  // Resolve cwd — param overrides agent default, supports absolute and relative paths.
-  // This was already computed above so session placement, PI_CODING_AGENT_DIR, and cd agree.
+  // cd prefix — effectiveCwd was resolved above so placement, env, and cd agree.
   const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
 
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
@@ -1400,7 +1377,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   const shouldRegister = (name: string) => !deniedTools.has(name);
 
-  // ── subagent tool ──
   if (shouldRegister("subagent"))
     pi.registerTool({
       name: "subagent",
@@ -1604,7 +1580,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
     });
 
-  // ── subagent_interrupt tool ──
   if (shouldRegister("subagent_interrupt"))
     pi.registerTool({
       name: "subagent_interrupt",
@@ -1656,7 +1631,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
     });
 
-  // ── subagents_list tool ──
   if (shouldRegister("subagents_list"))
     pi.registerTool({
       name: "subagents_list",
@@ -1710,9 +1684,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
     });
 
-
-
-  // ── subagent_resume tool ──
   if (shouldRegister("subagent_resume"))
     pi.registerTool({
       name: "subagent_resume",
@@ -2017,7 +1988,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     },
   });
 
-  // ── subagent_result message renderer ──
   pi.registerMessageRenderer("subagent_result", (message, options, theme) => {
     const details = message.details as any;
     if (!details) return undefined;
@@ -2095,7 +2065,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     };
   });
 
-  // ── subagent_status message renderer ──
   pi.registerMessageRenderer("subagent_status", (message, options, theme) => {
     const details = message.details as any;
     const lines = Array.isArray(details?.lines) ? details.lines : [];
@@ -2124,7 +2093,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     };
   });
 
-  // ── subagent_ping message renderer ──
   pi.registerMessageRenderer("subagent_ping", (message, options, theme) => {
     const details = message.details as any;
     if (!details) return undefined;
@@ -2191,4 +2159,3 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     },
   });
 }
-// test
