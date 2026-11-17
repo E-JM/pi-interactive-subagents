@@ -56,7 +56,7 @@ If your shell startup is slow and subagent commands sometimes get dropped before
 export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500
 ```
 
-Subagent panes are created without stealing keyboard focus (cmux, tmux, herdr). Launch commands target child surfaces by explicit ID, so focus and command delivery are independent. On herdr, subagents split the parent pane just like on tmux — each split is labeled with the subagent name, and herdr detects the child agent and shows its live status. Because herdr's `pane read` cannot see the transcript of fullscreen (alt-screen) background panes, Pi-backed subagents on herdr launch with `--tui-mode regular` so their output stays readable for completion detection. Note: the `interactive` option controls parent status notifications, not terminal focus.
+Subagent panes are created without stealing keyboard focus (cmux, tmux, herdr). Launch commands target child surfaces by explicit ID, so focus and command delivery are independent. On herdr, the main agent's pane keeps a fixed share of the tab width on the left (default 40%, tunable with `PI_SUBAGENT_HERDR_PARENT_RATIO`), and every subagent gets an equal-width pane to the right: new subagents split the rightmost subagent pane instead of the parent, and all subagent panes are rebalanced whenever one spawns or closes. Each split is labeled with the subagent name, and herdr detects the child agent and shows its live status. Because herdr's `pane read` cannot see the transcript of fullscreen (alt-screen) background panes, Pi-backed subagents on herdr launch with `--tui-mode regular` so their output stays readable for completion detection. Note: the `interactive` option controls parent status notifications, not terminal focus.
 
 ## What's Included
 

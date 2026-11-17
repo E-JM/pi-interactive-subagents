@@ -778,6 +778,336 @@ export function parseHerdrPaneId(output: string, context: string): string {
   return paneId;
 }
 
+// ── herdr balanced subagent layout ──
+//
+// Goal layout: parent (main agent) at a fixed width on the left, every
+// subagent pane sharing the remaining width equally. Repeatedly splitting the
+// parent (the old behavior) left the main agent with a sliver of the tab.
+
+export interface HerdrRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface HerdrLayoutPane {
+  pane_id: string;
+  rect: HerdrRect;
+}
+
+export interface HerdrLayoutSplit {
+  id: string;
+  direction: "right" | "down";
+  ratio: number;
+  rect: HerdrRect;
+}
+
+export interface HerdrLayout {
+  area: HerdrRect;
+  panes: HerdrLayoutPane[];
+  splits: HerdrLayoutSplit[];
+  tab_id?: string;
+  zoomed?: boolean;
+}
+
+export function parseHerdrLayout(output: string): HerdrLayout | null {
+  const parsed = parseCmuxJson(output) as { result?: { layout?: HerdrLayout } } | null;
+  const layout = parsed?.result?.layout;
+  if (!layout || !layout.area || !Array.isArray(layout.panes)) return null;
+  return layout;
+}
+
+function readHerdrLayout(paneId?: string): HerdrLayout | null {
+  const args = ["pane", "layout"];
+  if (paneId) args.push("--pane", paneId);
+  try {
+    return parseHerdrLayout(execFileSync("herdr", args, { encoding: "utf8" }));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Tracked herdr subagent panes, kept on globalThis via Symbol.for so the list
+ * survives /reload (same pattern as the widget timers in index.ts).
+ */
+const HERDR_SUBAGENT_PANES_KEY = Symbol.for("pi-subagents/herdr-subagent-panes");
+
+function herdrSubagentPaneList(): string[] {
+  const store = globalThis as Record<symbol, unknown>;
+  if (!Array.isArray(store[HERDR_SUBAGENT_PANES_KEY])) {
+    store[HERDR_SUBAGENT_PANES_KEY] = [];
+  }
+  return store[HERDR_SUBAGENT_PANES_KEY] as string[];
+}
+
+function setHerdrSubagentPaneList(paneIds: string[]): void {
+  (globalThis as Record<symbol, unknown>)[HERDR_SUBAGENT_PANES_KEY] = [...paneIds];
+}
+
+function herdrTrackPane(paneId: string): void {
+  const panes = herdrSubagentPaneList();
+  if (!panes.includes(paneId)) panes.push(paneId);
+}
+
+function herdrUntrackPane(paneId: string): void {
+  setHerdrSubagentPaneList(herdrSubagentPaneList().filter((id) => id !== paneId));
+}
+
+/** Default fraction of the tab width reserved for the parent (main agent) pane. */
+const DEFAULT_HERDR_PARENT_RATIO = 0.4;
+
+function herdrParentRatio(): number {
+  const value = Number(process.env.PI_SUBAGENT_HERDR_PARENT_RATIO);
+  return Number.isFinite(value) && value >= 0.1 && value <= 0.9
+    ? value
+    : DEFAULT_HERDR_PARENT_RATIO;
+}
+
+/** Ratio deltas below this are treated as already-balanced (avoids rounding churn). */
+const HERDR_RESIZE_EPSILON = 0.01;
+
+/**
+ * One `herdr pane resize` step.
+ *
+ * herdr resizes move the divider on the given side of `paneId` by `amount`
+ * (a ratio delta). Anchoring matters: subagent cell i's *right* divider is the
+ * split between it and the rest of the row, so growing cell i anchors on cell
+ * i (`direction: "right"`), while shrinking it anchors on its right neighbor
+ * (`direction: "left"`) — the same divider, approached from the other side.
+ */
+export interface HerdrResizeOp {
+  paneId: string;
+  direction: "left" | "right";
+  amount: number;
+}
+
+/**
+ * Plan the resize ops that arrange the tab as: parent pane at `parentRatio`
+ * of the width on the left, and every full-height pane to its right (subagent
+ * panes) sharing the remaining width equally. Pure — no CLI calls.
+ *
+ * The layout is a binary split tree; herdr resizes move one divider by a
+ * ratio delta, so each split is targeted independently in ratio space (safe
+ * at any nesting depth because moving an outer split changes inner regions'
+ * absolute widths but not their ratios). Other panes (left of the parent or
+ * partial-height) are frozen at their current width.
+ */
+export function planHerdrRebalance(
+  layout: HerdrLayout,
+  parentPaneId: string,
+  parentRatio: number,
+): HerdrResizeOp[] {
+  const ops: HerdrResizeOp[] = [];
+  const total = layout.area;
+  if (!(total.width > 0) || !(total.height > 0)) return ops;
+
+  const parent = layout.panes.find((pane) => pane.pane_id === parentPaneId);
+  if (!parent) return ops;
+  // Balancing assumes a full-height parent in a single-row layout.
+  if (parent.rect.height < total.height - 2 || parent.rect.y > total.y + 2) return ops;
+
+  // Column cells: full-height panes starting at/after the parent's right edge.
+  const parentRight = parent.rect.x + parent.rect.width;
+  const cells = layout.panes
+    .filter(
+      (pane) =>
+        pane.pane_id !== parentPaneId &&
+        pane.rect.x >= parentRight - 1 &&
+        pane.rect.height >= total.height - 2 &&
+        pane.rect.y <= total.y + 2,
+    )
+    .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
+
+  // Panes we won't move (left of the parent, or stacked rows): keep widths.
+  const cellIds = new Set(cells.map((cell) => cell.pane_id));
+  if (cellIds.size === 0) return ops; // nothing to balance
+  const frozenSum = layout.panes
+    .filter((pane) => pane.pane_id !== parentPaneId && !cellIds.has(pane.pane_id))
+    .reduce((sum, pane) => sum + pane.rect.width, 0);
+
+  const parentTarget = parentRatio * total.width;
+  const remaining = total.width - parentTarget - frozenSum;
+  if (cells.length > 0 && !(remaining > 5)) return ops; // cannot fit; don't fight the layout
+  const cellTarget = cells.length > 0 ? remaining / cells.length : 0;
+
+  const targetWidth = (pane: HerdrLayoutPane): number => {
+    if (pane.pane_id === parentPaneId) return parentTarget;
+    if (cellIds.has(pane.pane_id)) return cellTarget;
+    return pane.rect.width; // frozen
+  };
+
+  const inRect = (pane: HerdrLayoutPane, rect: HerdrRect): boolean =>
+    pane.rect.x >= rect.x - 1.5 &&
+    pane.rect.y >= rect.y - 1.5 &&
+    pane.rect.x + pane.rect.width <= rect.x + rect.width + 1.5 &&
+    pane.rect.y + pane.rect.height <= rect.y + rect.height + 1.5;
+
+  // Wider (outer) splits first so anchors sit next to the divider being moved.
+  const rightSplits = layout.splits.filter((split) => split.direction === "right");
+  const splits = [...rightSplits].sort(
+    (a, b) => b.rect.width * b.rect.height - a.rect.width * a.rect.height,
+  );
+  const dividerXOf = (split: HerdrLayoutSplit): number =>
+    split.rect.x + split.rect.width * split.ratio;
+  const overlapsY = (anchor: HerdrLayoutPane, rect: HerdrRect): boolean =>
+    anchor.rect.y < rect.y + rect.height + 1.5 && anchor.rect.y + anchor.rect.height > rect.y - 1.5;
+
+  /**
+   * Legacy layouts (repeatedly splitting the parent) can stack two splits'
+   * dividers at the same x, making a resize of the anchor pane ambiguous —
+   * herdr may move either one. Bail on such layouts: guessing can shrink the
+   * parent instead of growing it. Clean layouts created by this code never
+   * collide (each divider is separated by at least one full cell).
+   */
+  let ambiguous = false;
+
+  for (const split of splits) {
+    const dividerX = dividerXOf(split);
+    const leftRect: HerdrRect = {
+      x: split.rect.x,
+      y: split.rect.y,
+      width: dividerX - split.rect.x,
+      height: split.rect.height,
+    };
+    const rightRect: HerdrRect = {
+      x: dividerX,
+      y: split.rect.y,
+      width: split.rect.x + split.rect.width - dividerX,
+      height: split.rect.height,
+    };
+    const leftLeaves = layout.panes.filter((pane) => inRect(pane, leftRect));
+    const rightLeaves = layout.panes.filter((pane) => inRect(pane, rightRect));
+    if (leftLeaves.length === 0 || rightLeaves.length === 0) continue;
+
+    const leftTarget = leftLeaves.reduce((sum, pane) => sum + targetWidth(pane), 0);
+    const rightTarget = rightLeaves.reduce((sum, pane) => sum + targetWidth(pane), 0);
+    if (!(leftTarget + rightTarget > 0)) continue;
+
+    const delta = leftTarget / (leftTarget + rightTarget) - split.ratio;
+    if (Math.abs(delta) < HERDR_RESIZE_EPSILON) continue;
+
+    let anchor: HerdrLayoutPane;
+    let grow: boolean;
+    if (delta > 0) {
+      // Grow the left subtree: move the divider right, anchored on the leaf
+      // beside it (rightmost pane on the left side).
+      anchor = [...leftLeaves].sort((a, b) => b.rect.x - a.rect.x)[0];
+      grow = true;
+    } else {
+      // Shrink the left subtree: same divider, approached from the right side.
+      anchor = [...rightLeaves].sort((a, b) => a.rect.x - b.rect.x)[0];
+      grow = false;
+    }
+
+    // The anchor must sit directly against this divider, and no other split's
+    // divider may coincide with it at the anchor's position.
+    const anchorEdge = grow ? anchor.rect.x + anchor.rect.width : anchor.rect.x;
+    if (Math.abs(anchorEdge - dividerX) > 1.5) continue;
+    for (const other of rightSplits) {
+      if (other === split) continue;
+      if (!overlapsY(anchor, other.rect)) continue;
+      if (Math.abs(dividerXOf(other) - dividerX) <= 1.5) {
+        ambiguous = true;
+        break;
+      }
+    }
+    if (ambiguous) break;
+
+    ops.push({
+      paneId: anchor.pane_id,
+      direction: grow ? "right" : "left",
+      amount: grow ? delta : -delta,
+    });
+  }
+  if (ambiguous) return [];
+  return ops;
+}
+
+function applyHerdrResizeOps(ops: HerdrResizeOp[]): void {
+  for (const op of ops) {
+    try {
+      execFileSync(
+        "herdr",
+        [
+          "pane",
+          "resize",
+          "--pane",
+          op.paneId,
+          "--direction",
+          op.direction,
+          "--amount",
+          op.amount.toFixed(4),
+        ],
+        { encoding: "utf8" },
+      );
+    } catch {
+      // Best effort — herdr clamps ratios and can refuse moves on tiny panes.
+    }
+  }
+}
+
+/**
+ * Bring the parent pane and every full-height subagent pane back to the
+ * balanced layout (parent fixed width, subagents equal width). Best effort:
+ * layout or resize failures never block spawning.
+ *
+ * Runs up to three plan→apply passes against a fresh layout each time: ratio
+ * rounding and herdr's ratio clamps can leave small residuals after one pass,
+ * and the second pass absorbs them (each pass strictly reduces the imbalance).
+ */
+function rebalanceHerdrSubagentLayout(parentPaneId: string): void {
+  for (let pass = 0; pass < 3; pass++) {
+    const layout = readHerdrLayout(parentPaneId);
+    if (!layout) return;
+    const ops = planHerdrRebalance(layout, parentPaneId, herdrParentRatio());
+    if (ops.length === 0) return;
+    applyHerdrResizeOps(ops);
+  }
+}
+
+/**
+ * Create a herdr surface for a subagent, keeping the tab layout balanced:
+ * the parent (main agent) keeps its width on the left, and each new subagent
+ * splits the rightmost subagent pane so all subagent panes stay equal width.
+ * Falls back to splitting the parent for the first subagent.
+ */
+function createHerdrSubagentSurface(name: string): string {
+  const parentPaneId = process.env.HERDR_PANE_ID;
+
+  // Anchor on the rightmost full-height pane to the right of the parent
+  // (geometric, so it self-heals after /reload); prune tracked panes the user
+  // closed. Falls back to splitting the parent for the first subagent.
+  let anchorPaneId = parentPaneId ?? undefined;
+  if (parentPaneId) {
+    const layout = readHerdrLayout(parentPaneId);
+    if (layout) {
+      const known = new Set(layout.panes.map((pane) => pane.pane_id));
+      setHerdrSubagentPaneList(herdrSubagentPaneList().filter((id) => known.has(id)));
+      const parent = layout.panes.find((pane) => pane.pane_id === parentPaneId);
+      if (parent) {
+        const anchor = layout.panes
+          .filter(
+            (pane) =>
+              pane.pane_id !== parentPaneId &&
+              pane.rect.x >= parent.rect.x + parent.rect.width - 1,
+          )
+          .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x)
+          .pop();
+        if (anchor) anchorPaneId = anchor.pane_id;
+      }
+    }
+  }
+
+  const paneId = createSurfaceSplit(name, "right", anchorPaneId);
+  herdrTrackPane(paneId);
+  if (parentPaneId) {
+    rebalanceHerdrSubagentLayout(parentPaneId);
+  }
+  return paneId;
+}
+
 /** Whether herdr currently detects a working agent turn in the given pane. */
 function isHerdrAgentWorking(surface: string): Promise<boolean> {
   return execFileAsync("herdr", ["agent", "get", surface], { encoding: "utf8" })
@@ -791,7 +1121,9 @@ function isHerdrAgentWorking(surface: string): Promise<boolean> {
  * For cmux: the first call creates a right-split pane; subsequent calls add
  * tabs to that same pane (avoiding ever-narrower splits).
  * For zellij: chooses a tab-aware tiled or stacked placement.
- * For herdr: splits the parent pane like tmux (right split, no focus steal).
+ * For herdr: splits the rightmost subagent pane (no focus steal), keeping the
+ * parent pane at a fixed width, then rebalances so all subagent panes are
+ * equally wide (`PI_SUBAGENT_HERDR_PARENT_RATIO`, default 0.4).
  * For tmux/wezterm: falls back to split behavior.
  *
  * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm, `w1:p7` in herdr).
@@ -821,15 +1153,13 @@ export function createSurface(name: string): string {
     return createZellijSurface(name);
   }
 
-  // On tmux/herdr, target the parent pi's pane so splits follow the agent, not the user's focus.
-  // See https://github.com/HazAT/pi-interactive-subagents/issues/12
-  let fromSurface: string | undefined;
-  if (backend === "tmux") {
-    fromSurface = process.env.TMUX_PANE;
-  } else if (backend === "herdr") {
-    fromSurface = process.env.HERDR_PANE_ID;
+  if (backend === "herdr") {
+    return createHerdrSubagentSurface(name);
   }
-  return createSurfaceSplit(name, "right", fromSurface);
+
+  // On tmux, target the parent pi's pane so splits follow the agent, not the user's focus.
+  // See https://github.com/HazAT/pi-interactive-subagents/issues/12
+  return createSurfaceSplit(name, "right", process.env.TMUX_PANE);
 }
 
 /**
@@ -1321,6 +1651,14 @@ export function closeSurface(surface: string): void {
 
   if (backend === "herdr") {
     execFileSync("herdr", ["pane", "close", surface], { encoding: "utf8" });
+    // Rebalance the remaining subagent panes so they share the freed width.
+    if (herdrSubagentPaneList().includes(surface)) {
+      herdrUntrackPane(surface);
+      const parentPaneId = process.env.HERDR_PANE_ID;
+      if (parentPaneId) {
+        rebalanceHerdrSubagentLayout(parentPaneId);
+      }
+    }
     return;
   }
 
