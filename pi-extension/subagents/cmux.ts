@@ -856,13 +856,17 @@ function herdrUntrackPane(paneId: string): void {
 }
 
 /** Default fraction of the tab width reserved for the parent (main agent) pane. */
-const DEFAULT_HERDR_PARENT_RATIO = 0.4;
+const DEFAULT_SUBAGENT_PARENT_RATIO = 0.4;
 
-function herdrParentRatio(): number {
-  const value = Number(process.env.PI_SUBAGENT_HERDR_PARENT_RATIO);
+function parentRatioFromEnv(envName: string): number {
+  const value = Number(process.env[envName]);
   return Number.isFinite(value) && value >= 0.1 && value <= 0.9
     ? value
-    : DEFAULT_HERDR_PARENT_RATIO;
+    : DEFAULT_SUBAGENT_PARENT_RATIO;
+}
+
+function herdrParentRatio(): number {
+  return parentRatioFromEnv("PI_SUBAGENT_HERDR_PARENT_RATIO");
 }
 
 /** Ratio deltas below this are treated as already-balanced (avoids rounding churn). */
@@ -1108,6 +1112,211 @@ function createHerdrSubagentSurface(name: string): string {
   return paneId;
 }
 
+// ── tmux balanced subagent layout ──
+// Same goal as herdr: parent at a fixed width on the left, every subagent
+// pane sharing the remaining width equally. tmux resizes take absolute
+// column counts (`resize-pane -x`), so no ratio math is needed — each op
+// pins the divider on that pane's right edge, applied parent first, then
+// cells left to right.
+
+export interface TmuxPaneGeometry {
+  paneId: string;
+  left: number;
+  top: number;
+  width: number;
+  height: number;
+  windowWidth: number;
+}
+
+const TMUX_GEOMETRY_FORMAT =
+  "#{pane_id}|#{pane_left}|#{pane_top}|#{pane_width}|#{pane_height}|#{window_width}";
+
+export function parseTmuxPaneGeometry(output: string): TmuxPaneGeometry[] {
+  const panes: TmuxPaneGeometry[] = [];
+  for (const line of output.split("\n")) {
+    if (!line.trim()) continue;
+    const parts = line.split("|");
+    if (parts.length < 6) continue;
+    const [paneId, left, top, width, height, windowWidth] = parts;
+    if (!paneId.startsWith("%")) continue;
+    const nums = [left, top, width, height, windowWidth].map(Number);
+    if (nums.some((n) => !Number.isFinite(n))) continue;
+    panes.push({
+      paneId,
+      left: nums[0],
+      top: nums[1],
+      width: nums[2],
+      height: nums[3],
+      windowWidth: nums[4],
+    });
+  }
+  return panes;
+}
+
+function readTmuxPaneGeometry(targetPaneId?: string): TmuxPaneGeometry[] {
+  const args = ["list-panes", "-F", TMUX_GEOMETRY_FORMAT];
+  if (targetPaneId) args.push("-t", targetPaneId);
+  try {
+    return parseTmuxPaneGeometry(execFileSync("tmux", args, { encoding: "utf8" }));
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Tracked tmux subagent panes, kept on globalThis via Symbol.for so the list
+ * survives /reload (same pattern as the herdr tracker).
+ */
+const TMUX_SUBAGENT_PANES_KEY = Symbol.for("pi-subagents/tmux-subagent-panes");
+
+function tmuxSubagentPaneList(): string[] {
+  const store = globalThis as Record<symbol, unknown>;
+  if (!Array.isArray(store[TMUX_SUBAGENT_PANES_KEY])) {
+    store[TMUX_SUBAGENT_PANES_KEY] = [];
+  }
+  return store[TMUX_SUBAGENT_PANES_KEY] as string[];
+}
+
+function setTmuxSubagentPaneList(paneIds: string[]): void {
+  (globalThis as Record<symbol, unknown>)[TMUX_SUBAGENT_PANES_KEY] = [...paneIds];
+}
+
+function tmuxTrackPane(paneId: string): void {
+  const panes = tmuxSubagentPaneList();
+  if (!panes.includes(paneId)) panes.push(paneId);
+}
+
+function tmuxUntrackPane(paneId: string): void {
+  setTmuxSubagentPaneList(tmuxSubagentPaneList().filter((id) => id !== paneId));
+}
+
+function tmuxParentRatio(): number {
+  return parentRatioFromEnv("PI_SUBAGENT_TMUX_PARENT_RATIO");
+}
+
+/** One `tmux resize-pane -x` step: set the pane's absolute column count. */
+export interface TmuxResizeOp {
+  paneId: string;
+  width: number;
+}
+
+/**
+ * Plan resize ops that arrange the window as: parent pane at `parentRatio`
+ * of the width on the left, and every full-height pane to its right sharing
+ * the remaining columns equally. Pure — no CLI calls. Ops are applied parent
+ * first, then cells left to right: each `-x` pins the divider on that pane's
+ * right edge, so later ops only redistribute columns further right. Panes
+ * already within one column of target are skipped to avoid churn.
+ */
+export function planTmuxRebalance(
+  panes: TmuxPaneGeometry[],
+  parentPaneId: string,
+  parentRatio: number,
+): TmuxResizeOp[] {
+  const parent = panes.find((pane) => pane.paneId === parentPaneId);
+  if (!parent) return [];
+  const windowWidth = parent.windowWidth;
+  if (!(windowWidth > 0) || !(parent.width > 0)) return [];
+
+  const parentRight = parent.left + parent.width;
+  const cells = panes
+    .filter(
+      (pane) =>
+        pane.paneId !== parentPaneId &&
+        pane.left >= parentRight - 1 &&
+        pane.height >= parent.height - 1 &&
+        pane.top <= parent.top + 1,
+    )
+    .sort((a, b) => a.top - b.top || a.left - b.left);
+  if (cells.length === 0) return [];
+
+  const parentTarget = Math.round(parentRatio * windowWidth);
+  const remaining = windowWidth - parentTarget;
+  // Every cell needs at least two columns to be worth resizing.
+  if (remaining < cells.length * 2) return [];
+
+  const cellTarget = Math.floor(remaining / cells.length);
+  const ops: TmuxResizeOp[] = [];
+  if (Math.abs(parent.width - parentTarget) > 1) {
+    ops.push({ paneId: parentPaneId, width: parentTarget });
+  }
+  for (const cell of cells) {
+    if (Math.abs(cell.width - cellTarget) > 1) {
+      ops.push({ paneId: cell.paneId, width: cellTarget });
+    }
+  }
+  return ops;
+}
+
+function applyTmuxResizeOps(ops: TmuxResizeOp[]): void {
+  for (const op of ops) {
+    try {
+      execFileSync("tmux", ["resize-pane", "-t", op.paneId, "-x", String(op.width)], {
+        encoding: "utf8",
+      });
+    } catch {
+      // Best effort — tmux clamps to minimum pane sizes and can refuse moves.
+    }
+  }
+}
+
+/**
+ * Bring the parent pane and all full-height subagent panes back to the
+ * balanced layout (parent fixed width, subagents equal width). Best effort:
+ * layout or resize failures never block spawning. A second pass absorbs any
+ * residual drift from tmux's size clamps.
+ */
+function rebalanceTmuxSubagentLayout(parentPaneId: string): void {
+  for (let pass = 0; pass < 2; pass++) {
+    const panes = readTmuxPaneGeometry(parentPaneId);
+    if (panes.length === 0) return;
+    const ops = planTmuxRebalance(panes, parentPaneId, tmuxParentRatio());
+    if (ops.length === 0) return;
+    applyTmuxResizeOps(ops);
+  }
+}
+
+/**
+ * Create a tmux surface for a subagent, keeping the window layout balanced:
+ * the parent (main agent) keeps its width on the left, and each new subagent
+ * splits the rightmost subagent pane so all subagent panes stay equal width.
+ * Falls back to splitting the parent for the first subagent.
+ */
+function createTmuxSubagentSurface(name: string): string {
+  const parentPaneId = process.env.TMUX_PANE;
+
+  // Anchor on the rightmost full-height pane to the right of the parent
+  // (geometric, so it self-heals after /reload); prune tracked panes the
+  // user closed. Falls back to splitting the parent for the first subagent.
+  let anchorPaneId = parentPaneId ?? undefined;
+  if (parentPaneId) {
+    const panes = readTmuxPaneGeometry(parentPaneId);
+    if (panes.length > 0) {
+      const known = new Set(panes.map((pane) => pane.paneId));
+      setTmuxSubagentPaneList(tmuxSubagentPaneList().filter((id) => known.has(id)));
+      const parent = panes.find((pane) => pane.paneId === parentPaneId);
+      if (parent) {
+        const anchor = panes
+          .filter(
+            (pane) =>
+              pane.paneId !== parentPaneId &&
+              pane.left >= parent.left + parent.width - 1,
+          )
+          .sort((a, b) => a.top - b.top || a.left - b.left)
+          .pop();
+        if (anchor) anchorPaneId = anchor.paneId;
+      }
+    }
+  }
+
+  const paneId = createSurfaceSplit(name, "right", anchorPaneId);
+  tmuxTrackPane(paneId);
+  if (parentPaneId) {
+    rebalanceTmuxSubagentLayout(parentPaneId);
+  }
+  return paneId;
+}
+
 /** Whether herdr currently detects a working agent turn in the given pane. */
 function isHerdrAgentWorking(surface: string): Promise<boolean> {
   return execFileAsync("herdr", ["agent", "get", surface], { encoding: "utf8" })
@@ -1124,7 +1333,9 @@ function isHerdrAgentWorking(surface: string): Promise<boolean> {
  * For herdr: splits the rightmost subagent pane (no focus steal), keeping the
  * parent pane at a fixed width, then rebalances so all subagent panes are
  * equally wide (`PI_SUBAGENT_HERDR_PARENT_RATIO`, default 0.4).
- * For tmux/wezterm: falls back to split behavior.
+ * For tmux: same balanced layout as herdr (`PI_SUBAGENT_TMUX_PARENT_RATIO`),
+ * using absolute `resize-pane -x` widths.
+ * For wezterm: falls back to split behavior.
  *
  * Returns an identifier (`surface:42` in cmux, `%12` in tmux, `pane:7` in zellij, `42` in wezterm, `w1:p7` in herdr).
  */
@@ -1157,9 +1368,14 @@ export function createSurface(name: string): string {
     return createHerdrSubagentSurface(name);
   }
 
-  // On tmux, target the parent pi's pane so splits follow the agent, not the user's focus.
-  // See https://github.com/HazAT/pi-interactive-subagents/issues/12
-  return createSurfaceSplit(name, "right", process.env.TMUX_PANE);
+  if (backend === "tmux") {
+    return createTmuxSubagentSurface(name);
+  }
+
+  // On wezterm, target the parent pi's pane so splits follow the agent, not
+  // the user's focus (wezterm exposes no pane-position API for a balanced
+  // layout yet).
+  return createSurfaceSplit(name, "right", process.env.WEZTERM_PANE);
 }
 
 /**
@@ -1646,6 +1862,14 @@ export function closeSurface(surface: string): void {
 
   if (backend === "tmux") {
     execFileSync("tmux", ["kill-pane", "-t", surface], { encoding: "utf8" });
+    // Rebalance the remaining subagent panes so they share the freed width.
+    if (tmuxSubagentPaneList().includes(surface)) {
+      tmuxUntrackPane(surface);
+      const parentPaneId = process.env.TMUX_PANE;
+      if (parentPaneId) {
+        rebalanceTmuxSubagentLayout(parentPaneId);
+      }
+    }
     return;
   }
 
