@@ -60,7 +60,18 @@ If your shell startup is slow and subagent commands sometimes get dropped before
 export PI_SUBAGENT_SHELL_READY_DELAY_MS=2500
 ```
 
-Subagent panes are created without stealing keyboard focus (cmux, tmux, herdr). Launch commands target child surfaces by explicit ID, so focus and command delivery are independent. On herdr and tmux, the main agent's pane keeps a fixed share of the tab width on the left (default 40%, tunable with `PI_SUBAGENT_HERDR_PARENT_RATIO` / `PI_SUBAGENT_TMUX_PARENT_RATIO`), and every subagent gets an equal-width pane to the right: new subagents split the rightmost subagent pane instead of the parent, and all subagent panes are rebalanced whenever one spawns or closes. Each split is labeled with the subagent name, and herdr detects the child agent and shows its live status. Because herdr's `pane read` cannot see the transcript of fullscreen (alt-screen) background panes, Pi-backed subagents on herdr launch with `--tui-mode regular` so their output stays readable for completion detection. Note: the `interactive` option controls parent status notifications, not terminal focus.
+Subagent panes are created without stealing keyboard focus (cmux, tmux, herdr). Launch commands target child surfaces by explicit ID, so focus and command delivery are independent. On herdr and tmux, the main agent's pane keeps a fixed share of the tab width on the left (default 40%, tunable with `PI_SUBAGENT_HERDR_PARENT_RATIO` / `PI_SUBAGENT_TMUX_PARENT_RATIO`), and every subagent gets a pane to the right. Each split is labeled with the subagent name, and herdr detects the child agent and shows its live status. Because herdr's `pane read` cannot see the transcript of fullscreen (alt-screen) background panes, Pi-backed subagents on herdr launch with `--tui-mode regular` so their output stays readable for completion detection. Note: the `interactive` option controls parent status notifications, not terminal focus.
+
+#### Pane layouts (herdr & tmux)
+
+Two layouts control how subagent panes fill the space to the right of the main agent:
+
+- **`columns`** (default) — every subagent gets a full-height column; new subagents split the rightmost subagent pane, and all columns are rebalanced to equal width whenever one spawns or closes.
+- **`tiled`** — subagents fill a block grid (1×1 → 1×2 → 2×2 → 2×3 → 3×3 → 3×4 …). Each new subagent is carved out of the pane covering the next grid cell, and the grid is rebalanced so cells stay as equal as the layout allows.
+
+Switch layouts with the **`/subagent-layout`** command (no arguments toggles, or pass `columns` / `tiled` explicitly). The choice persists across restarts and applies to newly spawned subagents; existing panes keep their geometry until the next spawn or close. You can also set the default with the `PI_SUBAGENT_LAYOUT=columns|tiled` environment variable — a persisted `/subagent-layout` choice wins over the env var.
+
+cmux, zellij, and WezTerm keep their own layout behavior regardless of this setting.
 
 ## What's Included
 

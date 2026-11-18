@@ -1,8 +1,8 @@
-import { execSync, execFile, execFileSync, spawnSync } from "node:child_process";
-import { promisify } from "node:util";
-import { existsSync, readFileSync, rmSync, writeFileSync, mkdirSync, statSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { execFile, execFileSync, execSync, spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
+import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
@@ -857,13 +857,328 @@ function herdrParentRatio(): number {
   return parentRatioFromEnv("PI_SUBAGENT_HERDR_PARENT_RATIO");
 }
 
+// --- Subagent layout mode (columns vs tiled grid, herdr/tmux only) ---
+
+export type SubagentLayoutMode = "columns" | "tiled";
+
+const LAYOUT_MODE_KEY = Symbol.for("pi-subagents/layout-mode");
+const LAYOUT_MODE_FILE = "subagents-layout.json";
+
+function parseLayoutMode(value: unknown): SubagentLayoutMode | null {
+  return value === "columns" || value === "tiled" ? value : null;
+}
+
+function agentConfigDirForLayout(): string {
+  return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
+}
+
+function readPersistedLayoutMode(): SubagentLayoutMode | null {
+  try {
+    const raw = JSON.parse(readFileSync(join(agentConfigDirForLayout(), LAYOUT_MODE_FILE), "utf8"));
+    return parseLayoutMode(raw?.mode);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Resolve the active subagent pane layout for herdr/tmux. Precedence: the
+ * choice persisted by /subagent-layout, then PI_SUBAGENT_LAYOUT, then
+ * "columns". Cached on globalThis so it survives /reload.
+ */
+export function getSubagentLayoutMode(): SubagentLayoutMode {
+  const store = globalThis as Record<symbol, unknown>;
+  const cached = parseLayoutMode(store[LAYOUT_MODE_KEY]);
+  if (cached) return cached;
+  const mode =
+    readPersistedLayoutMode() ?? parseLayoutMode(process.env.PI_SUBAGENT_LAYOUT) ?? "columns";
+  store[LAYOUT_MODE_KEY] = mode;
+  return mode;
+}
+
+/** Set the layout mode and persist it so the choice survives restarts. */
+export function setSubagentLayoutMode(mode: SubagentLayoutMode): void {
+  (globalThis as Record<symbol, unknown>)[LAYOUT_MODE_KEY] = mode;
+  try {
+    mkdirSync(agentConfigDirForLayout(), { recursive: true });
+    writeFileSync(
+      join(agentConfigDirForLayout(), LAYOUT_MODE_FILE),
+      `${JSON.stringify({ mode }, null, 2)}\n`,
+    );
+  } catch {
+    // Best effort — the in-memory mode still applies to this session.
+  }
+}
+
+// --- Tiled grid geometry (shared by herdr and tmux) ---
+
+/** Rectangle in tab/window coordinates. */
+export interface GridRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+export interface GridDims {
+  cols: number;
+  rows: number;
+}
+
+/**
+ * Grid shape for `count` subagents. Rows = round(sqrt(count)), grown one axis
+ * at a time: 1×1 → 1×2 → 2×2 → 2×3 → 3×3 → 3×4 → 4×4 … so existing panes
+ * never need to change cells when the grid grows (binary split trees can
+ * only move dividers, not reflow panes).
+ */
+export function gridDimsForCount(count: number): GridDims {
+  const n = Math.max(1, count);
+  const rows = Math.max(1, Math.round(Math.sqrt(n)));
+  const cols = Math.max(1, Math.ceil(n / rows));
+  return { cols, rows };
+}
+
+/**
+ * How the grid grew at exactly `count` (compared to `count - 1`): "col" when
+ * a column was added, "row" when a row was added, null when the shape is
+ * unchanged (and for count < 2).
+ */
+function gridGrowthAt(count: number): "col" | "row" | null {
+  const prev = gridDimsForCount(count - 1);
+  const cur = gridDimsForCount(count);
+  if (cur.cols > prev.cols) return "col";
+  if (cur.rows > prev.rows) return "row";
+  return null;
+}
+
+/**
+ * Which axis the grid last grew on at or before `count`: "col" (2,5,10,17…),
+ * "row" (3,7,13…), or null when the grid is exactly full. Unclaimed cells
+ * left by a growth are absorbed by the neighbor pane on that axis.
+ */
+function lastGridGrowth(count: number): "col" | "row" | null {
+  for (let n = count; n >= 2; n--) {
+    const growth = gridGrowthAt(n);
+    if (growth) return growth;
+  }
+  return null;
+}
+
+/** First unclaimed cell in row-major scan order (origin as the fallback). */
+function firstFreeCell(
+  claimed: Set<string>,
+  rows: number,
+  cols: number,
+): { row: number; col: number } {
+  for (let row = 0; row < rows; row++) {
+    for (let col = 0; col < cols; col++) {
+      if (!claimed.has(`${row},${col}`)) return { row, col };
+    }
+  }
+  return { row: 0, col: 0 };
+}
+
+/**
+ * Cell (row, col) claimed by each of the first `count` spawns, in order.
+ * Every pane keeps its cell as the grid grows: a growth spawn claims the new
+ * column's top cell or the new row's left cell; other spawns take the first
+ * free cell in scan order.
+ */
+function spawnSlots(count: number): { row: number; col: number }[] {
+  const slots: { row: number; col: number }[] = [];
+  const claimed = new Set<string>();
+  for (let k = 1; k <= count; k++) {
+    const { cols, rows } = gridDimsForCount(k);
+    let slot: { row: number; col: number };
+    switch (gridGrowthAt(k)) {
+      case "col":
+        slot = { row: 0, col: cols - 1 };
+        break;
+      case "row":
+        slot = { row: rows - 1, col: 0 };
+        break;
+      default:
+        slot = firstFreeCell(claimed, rows, cols);
+    }
+    claimed.add(`${slot.row},${slot.col}`);
+    slots.push(slot);
+  }
+  return slots;
+}
+
+/**
+ * Minimum usable cell size for rebalance targets — smaller grids bail out
+ * instead of squeezing. (Spawn-time anchor selection uses stricter minimums,
+ * since a split must leave both halves usable.)
+ */
+const GRID_MIN_CELL_WIDTH = 10;
+const GRID_MIN_CELL_HEIGHT = 3;
+
+export interface GridTargets {
+  /** Target rect for the parent pane (left strip at `parentRatio`). */
+  parentRect: GridRect;
+  /** Target cell rect per tracked pane, keyed by pane id (row-major fill). */
+  cells: Map<string, GridRect>;
+}
+
+/**
+ * Grid targets: the parent keeps `parentRatio` of `area` width on the left;
+ * each tracked pane keeps the cell it was spawned into (spawn order), and —
+ * right after a grid growth — absorbs the unclaimed cells beside it (below
+ * for new rows, to the right for new columns), matching how the incremental
+ * splits actually stretch the neighboring panes. Returns null when the area
+ * is too small for usable cells.
+ */
+export function planGridTargets(
+  paneIds: string[],
+  area: GridRect,
+  parentRatio: number,
+): GridTargets | null {
+  if (paneIds.length === 0) return null;
+  const parentWidth = Math.round(parentRatio * area.width);
+  const regionWidth = area.width - parentWidth;
+  const count = paneIds.length;
+  const { cols, rows } = gridDimsForCount(count);
+  const cellWidth = regionWidth / cols;
+  const cellHeight = area.height / rows;
+  if (cellWidth < GRID_MIN_CELL_WIDTH || cellHeight < GRID_MIN_CELL_HEIGHT) return null;
+
+  const slots = spawnSlots(count);
+  const cellOf = new Map<string, { row: number; col: number }>();
+  paneIds.forEach((paneId, index) => {
+    cellOf.set(paneId, slots[index]);
+  });
+  const growth = lastGridGrowth(count);
+  const isUnclaimed = (row: number, col: number): boolean =>
+    row < rows && col < cols && !slots.some((s) => s.row === row && s.col === col);
+
+  const cells = new Map<string, GridRect>();
+  for (const [paneId, cell] of cellOf) {
+    let widthCells = 1;
+    let heightCells = 1;
+    if (growth === "col") {
+      while (isUnclaimed(cell.row, cell.col + widthCells)) widthCells++;
+    } else if (growth === "row") {
+      while (isUnclaimed(cell.row + heightCells, cell.col)) heightCells++;
+    }
+    cells.set(paneId, {
+      x: area.x + parentWidth + cell.col * cellWidth,
+      y: area.y + cell.row * cellHeight,
+      width: widthCells * cellWidth,
+      height: heightCells * cellHeight,
+    });
+  }
+  return {
+    parentRect: { x: area.x, y: area.y, width: parentWidth, height: area.height },
+    cells,
+  };
+}
+
+/** A pane with its current rect — the input for tiled anchor selection. */
+interface PlacedPane {
+  paneId: string;
+  rect: GridRect;
+}
+
+/**
+ * Rects of the tracked panes present in `panes`, in tracked (fill) order;
+ * tracked panes missing from `panes` are skipped.
+ */
+function placedPanes<Pane>(
+  trackedPaneIds: string[],
+  panes: readonly Pane[],
+  paneIdOf: (pane: Pane) => string,
+  rectOf: (pane: Pane) => GridRect,
+): PlacedPane[] {
+  const byId = new Map(panes.map((pane) => [paneIdOf(pane), pane]));
+  const placed: PlacedPane[] = [];
+  for (const id of trackedPaneIds) {
+    const pane = byId.get(id);
+    if (pane) placed.push({ paneId: id, rect: rectOf(pane) });
+  }
+  return placed;
+}
+
+export interface TiledAnchorSelection {
+  anchorPaneId: string;
+  direction: "right" | "down";
+}
+
+/**
+ * Pick which tracked pane to split for subagent #count (1-indexed) in tiled
+ * mode, and in which direction. `placed` holds the tracked panes with their
+ * current rects in fill order; `region` is the subagent area (right of the
+ * parent, full height). The anchor is the pane overlapping the target cell
+ * the most (ties: smaller pane, then fill order); the direction is whichever
+ * half-split of the anchor contains more of the target cell. Returns null
+ * when tiling isn't possible and the caller should fall back to columns.
+ */
+export function selectTiledGridAnchor(
+  placed: PlacedPane[],
+  region: GridRect,
+  count: number,
+  minCellWidth = 20,
+  minCellHeight = 6,
+): TiledAnchorSelection | null {
+  if (placed.length === 0 || count <= placed.length) return null;
+  const { cols, rows } = gridDimsForCount(count);
+  const cellWidth = region.width / cols;
+  const cellHeight = region.height / rows;
+  if (cellWidth < minCellWidth || cellHeight < minCellHeight) return null;
+
+  const spawnCell = spawnSlots(count)[count - 1];
+  const target: GridRect = {
+    x: region.x + spawnCell.col * cellWidth,
+    y: region.y + spawnCell.row * cellHeight,
+    width: cellWidth,
+    height: cellHeight,
+  };
+
+  const overlapArea = (a: GridRect, b: GridRect): number => {
+    const width = Math.min(a.x + a.width, b.x + b.width) - Math.max(a.x, b.x);
+    const height = Math.min(a.y + a.height, b.y + b.height) - Math.max(a.y, b.y);
+    return width > 0 && height > 0 ? width * height : 0;
+  };
+
+  const anchor = [...placed].sort((a, b) => {
+    const overlapDiff = overlapArea(b.rect, target) - overlapArea(a.rect, target);
+    if (Math.abs(overlapDiff) > 1) return overlapDiff;
+    return a.rect.width * a.rect.height - b.rect.width * b.rect.height;
+  })[0];
+  if (!anchor) return null;
+
+  const rightSlice: GridRect = {
+    x: anchor.rect.x + anchor.rect.width / 2,
+    y: anchor.rect.y,
+    width: anchor.rect.width / 2,
+    height: anchor.rect.height,
+  };
+  const downSlice: GridRect = {
+    x: anchor.rect.x,
+    y: anchor.rect.y + anchor.rect.height / 2,
+    width: anchor.rect.width,
+    height: anchor.rect.height / 2,
+  };
+  // Prefer "down" only when the bottom half clearly contains more of the cell.
+  const direction: "right" | "down" =
+    overlapArea(downSlice, target) > overlapArea(rightSlice, target) ? "down" : "right";
+
+  // Both halves of the anchor must stay usable after the split.
+  if (direction === "right") {
+    if (anchor.rect.width / 2 < minCellWidth) return null;
+  } else if (anchor.rect.height / 2 < minCellHeight) {
+    return null;
+  }
+  return { anchorPaneId: anchor.paneId, direction };
+}
+
 /** Ratio deltas below this are treated as already-balanced (avoids rounding churn). */
 const HERDR_RESIZE_EPSILON = 0.01;
 
 /** One `herdr pane resize` step: move the divider on the pane's `direction` side by `amount` (a ratio delta). */
 export interface HerdrResizeOp {
   paneId: string;
-  direction: "left" | "right";
+  direction: "left" | "right" | "up" | "down";
   amount: number;
 }
 
@@ -997,6 +1312,180 @@ export function planHerdrRebalance(
   return ops;
 }
 
+/** Axis-specific accessors, so one planner serves both divider orientations. */
+interface GridAxis {
+  /** Low edge of a rect along this axis. */
+  low: (rect: HerdrRect) => number;
+  /** Extent of a rect along this axis. */
+  size: (rect: HerdrRect) => number;
+  /** Sub-rect of `split.rect` spanning `[low, low + size)` along this axis. */
+  subRect: (split: HerdrLayoutSplit, low: number, size: number) => HerdrRect;
+  /** herdr resize direction that moves the divider toward larger coordinates. */
+  growDirection: "right" | "down";
+  /** herdr resize direction that moves the divider toward smaller coordinates. */
+  shrinkDirection: "left" | "up";
+}
+
+const AXIS_X: GridAxis = {
+  low: (rect) => rect.x,
+  size: (rect) => rect.width,
+  subRect: (split, low, size) => ({
+    x: low,
+    y: split.rect.y,
+    width: size,
+    height: split.rect.height,
+  }),
+  growDirection: "right",
+  shrinkDirection: "left",
+};
+
+const AXIS_Y: GridAxis = {
+  low: (rect) => rect.y,
+  size: (rect) => rect.height,
+  subRect: (split, low, size) => ({
+    x: split.rect.x,
+    y: low,
+    width: split.rect.width,
+    height: size,
+  }),
+  growDirection: "down",
+  shrinkDirection: "up",
+};
+
+/**
+ * Plan resize ops for one axis's dividers: each divider moves so its low side
+ * holds `lowTarget / (lowTarget + highTarget)` of the split ratio, where the
+ * side targets are bounding-box extents of the leaves' target rects (stacked
+ * panes share columns/rows, so summing extents would double-count). Splits
+ * are processed largest-area first. A split is skipped when either side has
+ * no leaves, the targets sum to zero, or the chosen anchor pane isn't flush
+ * against the divider — herdr resolves ops by the anchor pane, so aligned
+ * grids with coincident dividers across columns are safe; a non-adjacent
+ * anchor is not.
+ */
+function planDividerOps(
+  axis: GridAxis,
+  splits: HerdrLayoutSplit[],
+  layout: HerdrLayout,
+  targetRectOf: (pane: HerdrLayoutPane) => HerdrRect,
+  inRect: (pane: HerdrLayoutPane, rect: HerdrRect) => boolean,
+): HerdrResizeOp[] {
+  const ops: HerdrResizeOp[] = [];
+  const targetExtentOf = (leaves: HerdrLayoutPane[]): number => {
+    let low = Infinity;
+    let high = -Infinity;
+    for (const leaf of leaves) {
+      const rect = targetRectOf(leaf);
+      low = Math.min(low, axis.low(rect));
+      high = Math.max(high, axis.low(rect) + axis.size(rect));
+    }
+    return Number.isFinite(low) ? high - low : 0;
+  };
+
+  for (const split of splits) {
+    const start = axis.low(split.rect);
+    const span = axis.size(split.rect);
+    const divider = start + span * split.ratio;
+    const lowLeaves = layout.panes.filter((pane) =>
+      inRect(pane, axis.subRect(split, start, divider - start)),
+    );
+    const highLeaves = layout.panes.filter((pane) =>
+      inRect(pane, axis.subRect(split, divider, start + span - divider)),
+    );
+    if (lowLeaves.length === 0 || highLeaves.length === 0) continue;
+
+    const lowTarget = targetExtentOf(lowLeaves);
+    const highTarget = targetExtentOf(highLeaves);
+    if (!(lowTarget + highTarget > 0)) continue;
+
+    const delta = lowTarget / (lowTarget + highTarget) - split.ratio;
+    if (Math.abs(delta) < HERDR_RESIZE_EPSILON) continue;
+
+    let anchor: HerdrLayoutPane;
+    let grow: boolean;
+    if (delta > 0) {
+      anchor = [...lowLeaves].sort((a, b) => axis.low(b.rect) - axis.low(a.rect))[0];
+      grow = true;
+    } else {
+      anchor = [...highLeaves].sort((a, b) => axis.low(a.rect) - axis.low(b.rect))[0];
+      grow = false;
+    }
+
+    const anchorEdge = grow
+      ? axis.low(anchor.rect) + axis.size(anchor.rect)
+      : axis.low(anchor.rect);
+    if (Math.abs(anchorEdge - divider) > 1.5) continue;
+
+    ops.push({
+      paneId: anchor.pane_id,
+      direction: grow ? axis.growDirection : axis.shrinkDirection,
+      amount: grow ? delta : -delta,
+    });
+  }
+  return ops;
+}
+
+/**
+ * Plan resizes that lay the tab out as a tiled grid: parent at `parentRatio`
+ * width on the left, tracked panes (fill order) in a ceil(sqrt(n)) ×
+ * ceil(n/cols) grid of equal cells to its right. Handles both right-splits
+ * (vertical dividers) and down-splits (horizontal dividers); untracked panes
+ * are frozen. Pure — no CLI calls.
+ */
+export function planHerdrGridRebalance(
+  layout: HerdrLayout,
+  parentPaneId: string,
+  trackedPaneIds: string[],
+  parentRatio: number,
+): HerdrResizeOp[] {
+  const ops: HerdrResizeOp[] = [];
+  const total = layout.area;
+  if (!(total.width > 0) || !(total.height > 0)) return ops;
+
+  const parent = layout.panes.find((pane) => pane.pane_id === parentPaneId);
+  if (!parent) return ops;
+  // Balancing assumes a full-height parent strip on the left.
+  if (parent.rect.height < total.height - 2 || parent.rect.y > total.y + 2) return ops;
+
+  const tracked = trackedPaneIds.filter((id) => layout.panes.some((pane) => pane.pane_id === id));
+  // Unmanaged panes in the subagent region (user splits) — leave the layout alone.
+  const trackedSet = new Set(tracked);
+  const parentRight = parent.rect.x + parent.rect.width;
+  const isUnmanagedInRegion = (pane: HerdrLayoutPane): boolean =>
+    pane.pane_id !== parentPaneId &&
+    !trackedSet.has(pane.pane_id) &&
+    pane.rect.x >= parentRight - 1;
+  if (layout.panes.some(isUnmanagedInRegion)) return ops;
+  const targets = planGridTargets(tracked, total, parentRatio);
+  if (!targets) return ops;
+
+  const targetRectOf = (pane: HerdrLayoutPane): HerdrRect => {
+    if (pane.pane_id === parentPaneId) return targets.parentRect;
+    return targets.cells.get(pane.pane_id) ?? pane.rect; // frozen when untracked
+  };
+
+  const inRect = (pane: HerdrLayoutPane, rect: HerdrRect): boolean =>
+    pane.rect.x >= rect.x - 1.5 &&
+    pane.rect.y >= rect.y - 1.5 &&
+    pane.rect.x + pane.rect.width <= rect.x + rect.width + 1.5 &&
+    pane.rect.y + pane.rect.height <= rect.y + rect.height + 1.5;
+
+  const byAreaDesc = (a: HerdrLayoutSplit, b: HerdrLayoutSplit): number =>
+    b.rect.width * b.rect.height - a.rect.width * a.rect.height;
+  const verticalDividers = layout.splits
+    .filter((split) => split.direction === "right")
+    .sort(byAreaDesc);
+  const horizontalDividers = layout.splits
+    .filter((split) => split.direction === "down")
+    .sort(byAreaDesc);
+
+  ops.push(
+    ...planDividerOps(AXIS_X, verticalDividers, layout, targetRectOf, inRect),
+    ...planDividerOps(AXIS_Y, horizontalDividers, layout, targetRectOf, inRect),
+  );
+  return ops;
+}
+
 function applyHerdrResizeOps(ops: HerdrResizeOp[]): void {
   for (const op of ops) {
     try {
@@ -1035,15 +1524,152 @@ function rebalanceHerdrSubagentLayout(parentPaneId: string): void {
   }
 }
 
+/** Rightmost pane to the right of the parent (columns-mode anchor). */
+function rightmostHerdrAnchor(layout: HerdrLayout, parentPaneId: string): string | null {
+  const parent = layout.panes.find((pane) => pane.pane_id === parentPaneId);
+  if (!parent) return null;
+  const anchor = layout.panes
+    .filter(
+      (pane) =>
+        pane.pane_id !== parentPaneId && pane.rect.x >= parent.rect.x + parent.rect.width - 1,
+    )
+    .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x)
+    .pop();
+  return anchor?.pane_id ?? null;
+}
+
+/** Subagent region: right of the parent, full tab height. */
+function herdrSubagentRegion(layout: HerdrLayout, parent: HerdrLayoutPane): HerdrRect {
+  const parentRight = parent.rect.x + parent.rect.width;
+  return {
+    x: parentRight,
+    y: layout.area.y,
+    width: layout.area.x + layout.area.width - parentRight,
+    height: layout.area.height,
+  };
+}
+
 /**
- * Create a herdr subagent surface: the parent keeps its width, new subagents
- * split the rightmost subagent pane so all subagent panes stay equal width.
+ * Read the layout, waiting briefly for herdr to materialize all tracked panes.
+ * Under load (several pi instances launching at once), `pane layout` can lag a
+ * split by a few ms — planning against a layout that is missing the new pane
+ * would compute zero ops and leave the raw split geometry in place. Returns
+ * null while the layout is incomplete or unreadable.
+ */
+function waitForHerdrTrackedPanes(parentPaneId: string, timeoutMs = 500): HerdrLayout | null {
+  const tracked = herdrSubagentPaneList();
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const layout = readHerdrLayout(parentPaneId);
+    if (layout) {
+      const present = new Set(layout.panes.map((pane) => pane.pane_id));
+      if (tracked.every((id) => present.has(id))) return layout;
+    }
+    sleepSync(50);
+  }
+  return null;
+}
+
+/**
+ * Rebalance into the tiled grid. Runs up to three plan→apply passes against a
+ * fresh layout to absorb rounding and clamp residuals. Best effort — never
+ * blocks spawning.
+ */
+function rebalanceHerdrGridLayout(parentPaneId: string): void {
+  const tracked = herdrSubagentPaneList();
+  if (tracked.length === 0) return;
+  for (let pass = 0; pass < 3; pass++) {
+    const layout =
+      pass === 0 ? waitForHerdrTrackedPanes(parentPaneId) : readHerdrLayout(parentPaneId);
+    if (!layout) return;
+    const ops = planHerdrGridRebalance(layout, parentPaneId, tracked, herdrParentRatio());
+    if (ops.length === 0) return;
+    applyHerdrResizeOps(ops);
+  }
+}
+
+const HERDR_DEFERRED_REBALANCE_KEY = Symbol.for("pi-subagents/herdr-deferred-rebalance");
+
+/**
+ * Schedule trailing rebalances ~400ms apart (coalesced). Safety net for races:
+ * whichever spawn or close ran last, these passes re-read the settled layout
+ * and equalize anything the synchronous rebalance missed. Stops after 5 passes
+ * once the plan reports nothing left to do; while the layout keeps failing to
+ * read, retries up to 10 ticks before giving up.
+ */
+function scheduleHerdrDeferredRebalance(parentPaneId: string): void {
+  const store = globalThis as Record<symbol, unknown>;
+  const existing = store[HERDR_DEFERRED_REBALANCE_KEY] as NodeJS.Timeout | undefined;
+  if (existing) clearTimeout(existing);
+
+  let attempts = 0;
+
+  function tick(): void {
+    attempts += 1;
+    try {
+      const tiled = getSubagentLayoutMode() === "tiled";
+      const tracked = herdrSubagentPaneList();
+      // "Zero ops" only counts as converged when the layout actually shows
+      // every tracked pane — a stale read must keep retrying, not stop.
+      const layout =
+        tiled && tracked.length > 0
+          ? waitForHerdrTrackedPanes(parentPaneId, 300)
+          : readHerdrLayout(parentPaneId);
+      if (!layout) {
+        if (attempts >= 10) stop();
+        else scheduleNext();
+        return;
+      }
+      const ops = tiled
+        ? planHerdrGridRebalance(layout, parentPaneId, tracked, herdrParentRatio())
+        : planHerdrRebalance(layout, parentPaneId, herdrParentRatio());
+      if (ops.length > 0) applyHerdrResizeOps(ops);
+      if (ops.length === 0 || attempts >= 5) {
+        stop();
+        return;
+      }
+    } catch {
+      // Best effort — never surface deferred-rebalance failures.
+    }
+    scheduleNext();
+  }
+
+  function scheduleNext(): void {
+    const timer = setTimeout(tick, 400);
+    timer.unref?.();
+    store[HERDR_DEFERRED_REBALANCE_KEY] = timer;
+  }
+
+  function stop(): void {
+    delete store[HERDR_DEFERRED_REBALANCE_KEY];
+  }
+
+  scheduleNext();
+}
+
+function rebalanceHerdrLayoutForMode(parentPaneId: string): void {
+  if (getSubagentLayoutMode() === "tiled") {
+    rebalanceHerdrGridLayout(parentPaneId);
+  } else {
+    rebalanceHerdrSubagentLayout(parentPaneId);
+  }
+}
+
+/**
+ * Create a herdr subagent surface. In "columns" mode (default) the parent
+ * keeps its width and new subagents split the rightmost subagent pane so all
+ * subagent panes stay equal width. In "tiled" mode subagents fill a
+ * ceil(sqrt(n)) × ceil(n/cols) grid right of the parent: each spawn splits
+ * the pane covering the next grid cell (right/down) and the grid is
+ * rebalanced afterwards.
  */
 function createHerdrSubagentSurface(name: string): string {
   const parentPaneId = process.env.HERDR_PANE_ID;
+  const tiled = getSubagentLayoutMode() === "tiled";
 
-  // Anchor on the rightmost pane right of the parent (self-heals after /reload).
   let anchorPaneId = parentPaneId ?? undefined;
+  let splitDirection: "right" | "down" = "right";
+
   if (parentPaneId) {
     const layout = readHerdrLayout(parentPaneId);
     if (layout) {
@@ -1051,22 +1677,37 @@ function createHerdrSubagentSurface(name: string): string {
       setHerdrSubagentPaneList(herdrSubagentPaneList().filter((id) => known.has(id)));
       const parent = layout.panes.find((pane) => pane.pane_id === parentPaneId);
       if (parent) {
-        const anchor = layout.panes
-          .filter(
-            (pane) =>
-              pane.pane_id !== parentPaneId && pane.rect.x >= parent.rect.x + parent.rect.width - 1,
-          )
-          .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x)
-          .pop();
-        if (anchor) anchorPaneId = anchor.pane_id;
+        const tracked = herdrSubagentPaneList();
+        const placed = tiled
+          ? placedPanes(
+              tracked,
+              layout.panes,
+              (pane) => pane.pane_id,
+              (pane) => pane.rect,
+            )
+          : [];
+        const selection = selectTiledGridAnchor(
+          placed,
+          herdrSubagentRegion(layout, parent),
+          tracked.length + 1,
+        );
+        if (selection) {
+          anchorPaneId = selection.anchorPaneId;
+          splitDirection = selection.direction;
+        } else {
+          // Columns mode, or tiled fallback: rightmost pane (self-heals after /reload).
+          const anchor = rightmostHerdrAnchor(layout, parentPaneId);
+          if (anchor) anchorPaneId = anchor;
+        }
       }
     }
   }
 
-  const paneId = createSurfaceSplit(name, "right", anchorPaneId);
+  const paneId = createSurfaceSplit(name, splitDirection, anchorPaneId);
   herdrTrackPane(paneId);
   if (parentPaneId) {
-    rebalanceHerdrSubagentLayout(parentPaneId);
+    rebalanceHerdrLayoutForMode(parentPaneId);
+    scheduleHerdrDeferredRebalance(parentPaneId);
   }
   return paneId;
 }
@@ -1078,20 +1719,21 @@ export interface TmuxPaneGeometry {
   width: number;
   height: number;
   windowWidth: number;
+  windowHeight: number;
 }
 
 const TMUX_GEOMETRY_FORMAT =
-  "#{pane_id}|#{pane_left}|#{pane_top}|#{pane_width}|#{pane_height}|#{window_width}";
+  "#{pane_id}|#{pane_left}|#{pane_top}|#{pane_width}|#{pane_height}|#{window_width}|#{window_height}";
 
 export function parseTmuxPaneGeometry(output: string): TmuxPaneGeometry[] {
   const panes: TmuxPaneGeometry[] = [];
   for (const line of output.split("\n")) {
     if (!line.trim()) continue;
     const parts = line.split("|");
-    if (parts.length < 6) continue;
-    const [paneId, left, top, width, height, windowWidth] = parts;
+    if (parts.length < 7) continue;
+    const [paneId, left, top, width, height, windowWidth, windowHeight] = parts;
     if (!paneId.startsWith("%")) continue;
-    const nums = [left, top, width, height, windowWidth].map(Number);
+    const nums = [left, top, width, height, windowWidth, windowHeight].map(Number);
     if (nums.some((n) => !Number.isFinite(n))) continue;
     panes.push({
       paneId,
@@ -1100,6 +1742,7 @@ export function parseTmuxPaneGeometry(output: string): TmuxPaneGeometry[] {
       width: nums[2],
       height: nums[3],
       windowWidth: nums[4],
+      windowHeight: nums[5],
     });
   }
   return panes;
@@ -1219,15 +1862,169 @@ function rebalanceTmuxSubagentLayout(parentPaneId: string): void {
   }
 }
 
+/** One tmux resize step for the tiled grid: absolute width and/or height. */
+export interface TmuxGridResizeOp {
+  paneId: string;
+  width?: number;
+  height?: number;
+}
+
 /**
- * Create a tmux subagent surface: the parent keeps its width, new subagents
- * split the rightmost subagent pane so all subagent panes stay equal width.
+ * Target size along one axis, or undefined when no resize is needed: the pane
+ * is within 1 of the target, or it already reaches past its target toward the
+ * region's far edge (masonry panes tmux cannot shrink away from the edge).
+ */
+function tmuxAxisTarget(
+  current: number,
+  target: number,
+  paneAtFarEdge: boolean,
+  targetAtFarEdge: boolean,
+): number | undefined {
+  if (Math.abs(current - target) <= 1) return undefined;
+  if (paneAtFarEdge && !targetAtFarEdge) return undefined;
+  return Math.round(target);
+}
+
+/** Absolute width/height resize toward `cell`, or undefined when balanced. */
+function tmuxGridPaneOp(
+  pane: TmuxPaneGeometry,
+  cell: GridRect,
+  window: GridRect,
+): TmuxGridResizeOp | undefined {
+  const regionRight = window.x + window.width;
+  const regionBottom = window.y + window.height;
+  const width = tmuxAxisTarget(
+    pane.width,
+    cell.width,
+    pane.left + pane.width >= regionRight - 1,
+    cell.x + cell.width >= regionRight - 1,
+  );
+  const height = tmuxAxisTarget(
+    pane.height,
+    cell.height,
+    pane.top + pane.height >= regionBottom - 1,
+    cell.y + cell.height >= regionBottom - 1,
+  );
+  if (width === undefined && height === undefined) return undefined;
+  return { paneId: pane.paneId, width, height };
+}
+
+/**
+ * Plan absolute resizes that lay the window out as a tiled grid: parent at
+ * `parentRatio` width on the left (full height), tracked panes (fill order)
+ * in equal cells to its right. Masonry panes tmux cannot shrink away from
+ * the region's far edge are left alone; untracked panes are frozen. Pure —
+ * no CLI calls.
+ */
+export function planTmuxGridRebalance(
+  panes: TmuxPaneGeometry[],
+  parentPaneId: string,
+  trackedPaneIds: string[],
+  parentRatio: number,
+): TmuxGridResizeOp[] {
+  const parent = panes.find((pane) => pane.paneId === parentPaneId);
+  if (!parent) return [];
+  const window: GridRect = {
+    x: 0,
+    y: 0,
+    width: parent.windowWidth,
+    height: parent.windowHeight,
+  };
+  if (!(window.width > 0) || !(window.height > 0) || !(parent.width > 0)) return [];
+
+  const tracked = trackedPaneIds.filter((id) => panes.some((pane) => pane.paneId === id));
+  // Unmanaged panes in the subagent region (user splits) — leave the layout alone.
+  const trackedSet = new Set(tracked);
+  const parentRight = parent.left + parent.width;
+  const isUnmanagedInRegion = (pane: TmuxPaneGeometry): boolean =>
+    pane.paneId !== parentPaneId && !trackedSet.has(pane.paneId) && pane.left >= parentRight - 1;
+  if (panes.some(isUnmanagedInRegion)) return [];
+  const targets = planGridTargets(tracked, window, parentRatio);
+  if (!targets) return [];
+
+  const ops: TmuxGridResizeOp[] = [];
+  if (Math.abs(parent.width - targets.parentRect.width) > 1) {
+    ops.push({ paneId: parentPaneId, width: Math.round(targets.parentRect.width) });
+  }
+  for (const [paneId, cell] of targets.cells) {
+    const pane = panes.find((p) => p.paneId === paneId);
+    const op = pane ? tmuxGridPaneOp(pane, cell, window) : undefined;
+    if (op) ops.push(op);
+  }
+  return ops;
+}
+
+function applyTmuxGridResizeOps(ops: TmuxGridResizeOp[]): void {
+  for (const op of ops) {
+    try {
+      // tmux resizes one axis at a time: `-x` sets columns, `-y` sets rows.
+      const axes = [
+        ["-x", op.width],
+        ["-y", op.height],
+      ] as const;
+      for (const [flag, size] of axes) {
+        if (size === undefined) continue;
+        execFileSync("tmux", ["resize-pane", "-t", op.paneId, flag, String(size)], {
+          encoding: "utf8",
+        });
+      }
+    } catch {
+      // Best effort — tmux clamps to minimum pane sizes.
+    }
+  }
+}
+
+/**
+ * Rebalance into the tiled grid: parent fixed width, tracked panes in equal
+ * cells. Second pass absorbs any drift from tmux's size clamps. Best effort
+ * — never blocks spawning.
+ */
+function rebalanceTmuxGridLayout(parentPaneId: string): void {
+  const tracked = tmuxSubagentPaneList();
+  if (tracked.length === 0) return;
+  for (let pass = 0; pass < 2; pass++) {
+    const panes = readTmuxPaneGeometry(parentPaneId);
+    if (panes.length === 0) return;
+    const ops = planTmuxGridRebalance(panes, parentPaneId, tracked, tmuxParentRatio());
+    if (ops.length === 0) return;
+    applyTmuxGridResizeOps(ops);
+  }
+}
+
+function rebalanceTmuxLayoutForMode(parentPaneId: string): void {
+  if (getSubagentLayoutMode() === "tiled") {
+    rebalanceTmuxGridLayout(parentPaneId);
+  } else {
+    rebalanceTmuxSubagentLayout(parentPaneId);
+  }
+}
+
+/** Rightmost pane right of the parent (columns-mode anchor). */
+function rightmostTmuxAnchor(panes: TmuxPaneGeometry[], parentPaneId: string): string | null {
+  const parent = panes.find((pane) => pane.paneId === parentPaneId);
+  if (!parent) return null;
+  const anchor = panes
+    .filter((pane) => pane.paneId !== parentPaneId && pane.left >= parent.left + parent.width - 1)
+    .sort((a, b) => a.top - b.top || a.left - b.left)
+    .pop();
+  return anchor?.paneId ?? null;
+}
+
+/**
+ * Create a tmux subagent surface. In "columns" mode (default) the parent
+ * keeps its width and new subagents split the rightmost subagent pane so all
+ * subagent panes stay equal width. In "tiled" mode subagents fill a
+ * ceil(sqrt(n)) × ceil(n/cols) grid right of the parent: each spawn splits
+ * the pane covering the next grid cell (right/down) and the grid is
+ * rebalanced afterwards.
  */
 function createTmuxSubagentSurface(name: string): string {
   const parentPaneId = process.env.TMUX_PANE;
+  const tiled = getSubagentLayoutMode() === "tiled";
 
-  // Anchor on the rightmost pane right of the parent (self-heals after /reload).
   let anchorPaneId = parentPaneId ?? undefined;
+  let splitDirection: "right" | "down" = "right";
+
   if (parentPaneId) {
     const panes = readTmuxPaneGeometry(parentPaneId);
     if (panes.length > 0) {
@@ -1235,21 +2032,44 @@ function createTmuxSubagentSurface(name: string): string {
       setTmuxSubagentPaneList(tmuxSubagentPaneList().filter((id) => known.has(id)));
       const parent = panes.find((pane) => pane.paneId === parentPaneId);
       if (parent) {
-        const anchor = panes
-          .filter(
-            (pane) => pane.paneId !== parentPaneId && pane.left >= parent.left + parent.width - 1,
-          )
-          .sort((a, b) => a.top - b.top || a.left - b.left)
-          .pop();
-        if (anchor) anchorPaneId = anchor.paneId;
+        const tracked = tmuxSubagentPaneList();
+        const placed = tiled
+          ? tracked.flatMap((id) => {
+              const pane = panes.find((p) => p.paneId === id);
+              return pane
+                ? [
+                    {
+                      paneId: pane.paneId,
+                      rect: { x: pane.left, y: pane.top, width: pane.width, height: pane.height },
+                    },
+                  ]
+                : [];
+            })
+          : [];
+        const region: GridRect = {
+          x: parent.left + parent.width,
+          y: 0,
+          width: parent.windowWidth - (parent.left + parent.width),
+          height: parent.windowHeight,
+        };
+        const selection =
+          placed.length > 0 ? selectTiledGridAnchor(placed, region, tracked.length + 1) : null;
+        if (selection) {
+          anchorPaneId = selection.anchorPaneId;
+          splitDirection = selection.direction;
+        } else {
+          // Columns mode, or tiled fallback: rightmost pane (self-heals after /reload).
+          const anchor = rightmostTmuxAnchor(panes, parentPaneId);
+          if (anchor) anchorPaneId = anchor;
+        }
       }
     }
   }
 
-  const paneId = createSurfaceSplit(name, "right", anchorPaneId);
+  const paneId = createSurfaceSplit(name, splitDirection, anchorPaneId);
   tmuxTrackPane(paneId);
   if (parentPaneId) {
-    rebalanceTmuxSubagentLayout(parentPaneId);
+    rebalanceTmuxLayoutForMode(parentPaneId);
   }
   return paneId;
 }
@@ -1789,12 +2609,12 @@ export function closeSurface(surface: string): void {
 
   if (backend === "tmux") {
     execFileSync("tmux", ["kill-pane", "-t", surface], { encoding: "utf8" });
-    // Rebalance the remaining subagent panes so they share the freed width.
+    // Rebalance the remaining subagent panes so they share the freed space.
     if (tmuxSubagentPaneList().includes(surface)) {
       tmuxUntrackPane(surface);
       const parentPaneId = process.env.TMUX_PANE;
       if (parentPaneId) {
-        rebalanceTmuxSubagentLayout(parentPaneId);
+        rebalanceTmuxLayoutForMode(parentPaneId);
       }
     }
     return;
@@ -1802,12 +2622,13 @@ export function closeSurface(surface: string): void {
 
   if (backend === "herdr") {
     execFileSync("herdr", ["pane", "close", surface], { encoding: "utf8" });
-    // Rebalance the remaining subagent panes so they share the freed width.
+    // Rebalance the remaining subagent panes so they share the freed space.
     if (herdrSubagentPaneList().includes(surface)) {
       herdrUntrackPane(surface);
       const parentPaneId = process.env.HERDR_PANE_ID;
       if (parentPaneId) {
-        rebalanceHerdrSubagentLayout(parentPaneId);
+        rebalanceHerdrLayoutForMode(parentPaneId);
+        scheduleHerdrDeferredRebalance(parentPaneId);
       }
     }
     return;

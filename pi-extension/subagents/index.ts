@@ -22,6 +22,8 @@ import {
   pollForExit,
   closeSurface,
   getMuxBackend,
+  getSubagentLayoutMode,
+  setSubagentLayoutMode,
   sendEscape,
   shellEscape,
   renameCurrentTab,
@@ -2023,6 +2025,28 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const displayName = agentName[0].toUpperCase() + agentName.slice(1);
       const toolCall = `Use subagent with agent: "${agentName}", name: "${displayName}", task: ${JSON.stringify(taskText)}`;
       pi.sendUserMessage(toolCall);
+    },
+  });
+
+  // /subagent-layout command — toggle subagent pane layout (herdr/tmux)
+  pi.registerCommand("subagent-layout", {
+    description: "Toggle subagent pane layout: columns ↔ tiled grid (herdr/tmux)",
+    handler: async (args, ctx) => {
+      const arg = args.trim().toLowerCase();
+      if (arg && arg !== "columns" && arg !== "tiled") {
+        ctx.ui.notify("Usage: /subagent-layout [columns|tiled]", "warning");
+        return;
+      }
+      const current = getSubagentLayoutMode();
+      const next =
+        arg === "columns" || arg === "tiled" ? arg : current === "tiled" ? "columns" : "tiled";
+      setSubagentLayoutMode(next);
+      const backend = getMuxBackend();
+      const note =
+        backend === "herdr" || backend === "tmux"
+          ? ""
+          : " (note: this multiplexer uses its own layout)";
+      ctx.ui.notify(`Subagent layout: ${next}${note} — applies to newly spawned subagents`, "info");
     },
   });
 
