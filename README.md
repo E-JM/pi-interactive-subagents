@@ -69,7 +69,7 @@ Two layouts control how subagent panes fill the space to the right of the main a
 - **`columns`** (default) — every subagent gets a full-height column; new subagents split the rightmost subagent pane, and all columns are rebalanced to equal width whenever one spawns or closes.
 - **`tiled`** — subagents fill a block grid (1×1 → 1×2 → 2×2 → 2×3 → 3×3 → 3×4 …). Each new subagent is carved out of the pane covering the next grid cell, and the grid is rebalanced so cells stay as equal as the layout allows.
 
-Switch layouts with the **`/subagent-layout`** command (no arguments toggles, or pass `columns` / `tiled` explicitly). The choice persists across restarts and applies to newly spawned subagents; existing panes keep their geometry until the next spawn or close. You can also set the default with the `PI_SUBAGENT_LAYOUT=columns|tiled` environment variable — a persisted `/subagent-layout` choice wins over the env var.
+Switch layouts with the **`/subagent-layout`** command: with no arguments it opens an interactive picker (current choice preselected, Esc cancels), or pass `columns` / `tiled` explicitly — both offer argument completion in the editor. The choice persists across restarts and applies to newly spawned subagents; existing panes keep their geometry until the next spawn or close. You can also set the default with the `PI_SUBAGENT_LAYOUT=columns|tiled` environment variable — a persisted `/subagent-layout` choice wins over the env var.
 
 cmux, zellij, and WezTerm keep their own layout behavior regardless of this setting.
 

@@ -1,7 +1,19 @@
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { keyHint } from "@mariozechner/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionContext,
+  ExtensionUIContext,
+} from "@mariozechner/pi-coding-agent";
+import { DynamicBorder, getSelectListTheme, keyHint } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
-import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import {
+  Box,
+  Container,
+  SelectList,
+  type SelectItem,
+  Text,
+  truncateToWidth,
+  visibleWidth,
+} from "@mariozechner/pi-tui";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -24,6 +36,7 @@ import {
   getMuxBackend,
   getSubagentLayoutMode,
   setSubagentLayoutMode,
+  type SubagentLayoutMode,
   sendEscape,
   shellEscape,
   renameCurrentTab,
@@ -1377,6 +1390,43 @@ async function watchSubagent(
   }
 }
 
+const SUBAGENT_LAYOUT_ITEMS: SelectItem[] = [
+  { value: "columns", label: "columns", description: "Full-height columns of equal width" },
+  { value: "tiled", label: "tiled", description: "Block grid: 1×1 → 2×2 → 2×3 → 3×3 …" },
+];
+
+/**
+ * Interactive layout picker, mirroring the built-in /thinking selector:
+ * bordered SelectList, current mode preselected, Esc cancels.
+ */
+async function selectSubagentLayout(
+  ui: ExtensionUIContext,
+  current: SubagentLayoutMode,
+): Promise<SubagentLayoutMode | undefined> {
+  return ui.custom<SubagentLayoutMode | undefined>((_tui, _theme, _keybindings, done) => {
+    const container = new Container();
+    container.addChild(new DynamicBorder());
+    const list = new SelectList(
+      SUBAGENT_LAYOUT_ITEMS,
+      SUBAGENT_LAYOUT_ITEMS.length,
+      getSelectListTheme(),
+    );
+    const currentIndex = SUBAGENT_LAYOUT_ITEMS.findIndex((item) => item.value === current);
+    if (currentIndex !== -1) list.setSelectedIndex(currentIndex);
+    list.onSelect = (item) => {
+      if (item.value === "columns" || item.value === "tiled") done(item.value);
+    };
+    list.onCancel = () => done(undefined);
+    container.addChild(list);
+    container.addChild(new DynamicBorder());
+    return {
+      render: (width: number) => container.render(width),
+      handleInput: (data: string) => list.handleInput(data),
+      invalidate: () => list.invalidate(),
+    };
+  });
+}
+
 export default function subagentsExtension(pi: ExtensionAPI) {
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
@@ -2028,9 +2078,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     },
   });
 
-  // /subagent-layout command — toggle subagent pane layout (herdr/tmux)
+  // /subagent-layout command — pick subagent pane layout (herdr/tmux)
   pi.registerCommand("subagent-layout", {
-    description: "Toggle subagent pane layout: columns ↔ tiled grid (herdr/tmux)",
+    description: "Subagent pane layout: columns ↔ tiled grid (herdr/tmux)",
+    getArgumentCompletions: (argumentPrefix) => {
+      const prefix = argumentPrefix.trim().toLowerCase();
+      const items = SUBAGENT_LAYOUT_ITEMS.filter((item) => item.value.startsWith(prefix));
+      return items.length > 0 ? items : null;
+    },
     handler: async (args, ctx) => {
       const arg = args.trim().toLowerCase();
       if (arg && arg !== "columns" && arg !== "tiled") {
@@ -2039,7 +2094,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       }
       const current = getSubagentLayoutMode();
       const next =
-        arg === "columns" || arg === "tiled" ? arg : current === "tiled" ? "columns" : "tiled";
+        arg === "columns" || arg === "tiled" ? arg : await selectSubagentLayout(ctx.ui, current);
+      if (!next) return; // picker canceled
       setSubagentLayoutMode(next);
       const backend = getMuxBackend();
       const note =
