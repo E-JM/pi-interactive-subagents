@@ -3,10 +3,11 @@
  * - Shows agent identity + available tools as a styled widget above the editor (toggle with Ctrl+J)
  * - Provides a `subagent_done` tool for autonomous agents to self-terminate
  */
+
+import { writeFileSync } from "node:fs";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
@@ -51,16 +52,20 @@ export interface SubagentErrorInfo {
  * Returns `null` when the latest assistant turn completed normally or was
  * aborted by the user (handled separately by shouldAutoExitOnAgentEnd).
  */
-export function findLatestAssistantError(messages: any[] | undefined): SubagentErrorInfo | null {
+export function findLatestAssistantError(
+  messages: any[] | undefined,
+): SubagentErrorInfo | null {
   if (!messages) return null;
   for (let i = messages.length - 1; i >= 0; i--) {
     const msg = messages[i];
     if (msg?.role !== "assistant") continue;
     if (msg.stopReason !== "error") return null;
-    const raw = typeof msg.errorMessage === "string" ? msg.errorMessage.trim() : "";
+    const raw =
+      typeof msg.errorMessage === "string" ? msg.errorMessage.trim() : "";
     return {
       errorMessage:
-        raw || "Subagent agent loop ended with stopReason=error (no errorMessage field).",
+        raw ||
+        "Subagent agent loop ended with stopReason=error (no errorMessage field).",
       stopReason: "error",
     };
   }
@@ -89,14 +94,21 @@ export default function (pi: ExtensionAPI) {
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
   });
 
-  function renderWidget(ctx: { ui: { setWidget: Function } }, _theme: any) {
+  function renderWidget(
+    ctx: { ui: { setWidget: (key: string, content: unknown) => void } },
+    _theme: any,
+  ) {
     ctx.ui.setWidget(
       "subagent-tools",
       (_tui: any, theme: any) => {
-        const box = new Box(1, 0, (text: string) => theme.bg("toolSuccessBg", text));
+        const box = new Box(1, 0, (text: string) =>
+          theme.bg("toolSuccessBg", text),
+        );
 
         const label = subagentAgent || subagentName;
-        const agentTag = label ? theme.bold(theme.fg("accent", `[${label}]`)) : "";
+        const agentTag = label
+          ? theme.bold(theme.fg("accent", `[${label}]`))
+          : "";
 
         if (expanded) {
           // Expanded: full tool list + denied
@@ -112,7 +124,7 @@ export default function (pi: ExtensionAPI) {
             const deniedList = denied
               .map((name: string) => theme.fg("error", name))
               .join(theme.fg("muted", ", "));
-            deniedLine = "\n" + theme.fg("muted", "denied: ") + deniedList;
+            deniedLine = `\n${theme.fg("muted", "denied: ")}${deniedList}`;
           }
 
           const content = new Text(
@@ -126,11 +138,16 @@ export default function (pi: ExtensionAPI) {
           const countInfo = theme.fg("dim", ` — ${toolNames.length} tools`);
           const deniedInfo =
             denied.length > 0
-              ? theme.fg("dim", " · ") + theme.fg("error", `${denied.length} denied`)
+              ? theme.fg("dim", " · ") +
+                theme.fg("error", `${denied.length} denied`)
               : "";
           const hint = theme.fg("muted", "  (Ctrl+J to expand)");
 
-          const content = new Text(`${agentTag}${countInfo}${deniedInfo}${hint}`, 0, 0);
+          const content = new Text(
+            `${agentTag}${countInfo}${deniedInfo}${hint}`,
+            0,
+            0,
+          );
           box.addChild(content);
         }
 
@@ -172,7 +189,8 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("agent_end", (event, ctx) => {
     const messages = (event as any).messages as any[] | undefined;
-    const shouldExit = autoExit && shouldAutoExitOnAgentEnd(userTookOver, messages);
+    const shouldExit =
+      autoExit && shouldAutoExitOnAgentEnd(userTookOver, messages);
 
     if (shouldExit) {
       // Surface stopReason: "error" turns (auto-retry exhausted, provider
@@ -232,7 +250,10 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_execution_start", (event) => {
-    recorder.toolExecutionStart((event as any).toolCallId, (event as any).toolName);
+    recorder.toolExecutionStart(
+      (event as any).toolCallId,
+      (event as any).toolName,
+    );
   });
 
   pi.on("tool_call", (event) => {
@@ -240,7 +261,10 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_execution_update", (event) => {
-    recorder.toolExecutionUpdate((event as any).toolCallId, (event as any).toolName);
+    recorder.toolExecutionUpdate(
+      (event as any).toolCallId,
+      (event as any).toolName,
+    );
   });
 
   pi.on("tool_result", (event) => {
@@ -248,7 +272,10 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("tool_execution_end", (event) => {
-    recorder.toolExecutionEnd((event as any).toolCallId, (event as any).toolName);
+    recorder.toolExecutionEnd(
+      (event as any).toolCallId,
+      (event as any).toolName,
+    );
   });
 
   pi.on("session_shutdown", (event) => {
@@ -294,7 +321,10 @@ export default function (pi: ExtensionAPI) {
       ctx.shutdown();
       return {
         content: [
-          { type: "text", text: "Ping sent. Session will exit and parent will be notified." },
+          {
+            type: "text",
+            text: "Ping sent. Session will exit and parent will be notified.",
+          },
         ],
         details: {},
       };

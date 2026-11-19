@@ -16,36 +16,41 @@
  *   PI_TEST_MODEL     — model for all pi sessions (default: anthropic/claude-haiku-4-5)
  *   PI_TEST_TIMEOUT   — per-test timeout in ms (default: 120000)
  */
-import { describe, it, before, after } from "node:test";
+
 import assert from "node:assert/strict";
-import { existsSync, readFileSync, unlinkSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
+import { after, before, describe, it } from "node:test";
 import {
-  getAvailableBackends,
-  setBackend,
-  restoreBackend,
-  createTestEnv,
   cleanupTestEnv,
+  createTestEnv,
   createTrackedSurface,
-  startPi,
-  waitForScreen,
-  waitForFile,
-  sleep,
-  uniqueId,
-  trackTempFile,
-  readScreen,
+  getAvailableBackends,
   PI_TIMEOUT,
+  readScreen,
+  restoreBackend,
+  setBackend,
+  sleep,
+  startPi,
   type TestEnv,
+  trackTempFile,
+  uniqueId,
+  waitForFile,
+  waitForScreen,
 } from "./harness.ts";
 
 const backends = getAvailableBackends();
 
 if (backends.length === 0) {
-  console.log("⚠️  No mux backend available — skipping subagent lifecycle integration tests");
+  console.log(
+    "⚠️  No mux backend available — skipping subagent lifecycle integration tests",
+  );
   console.log("   Run inside cmux or tmux to enable these tests.");
 }
 
 for (const backend of backends) {
-  describe(`subagent-lifecycle [${backend}]`, { timeout: PI_TIMEOUT * 3 }, () => {
+  describe(`subagent-lifecycle [${backend}]`, {
+    timeout: PI_TIMEOUT * 3,
+  }, () => {
     let prevMux: string | undefined;
     let env: TestEnv;
 
@@ -98,13 +103,23 @@ for (const backend of backends) {
       const sessionMatch = screen.match(/Session:\s*(\S+\.jsonl)/);
       if (sessionMatch) {
         const sessionFile = sessionMatch[1];
-        assert.ok(existsSync(sessionFile), `Subagent session file should exist: ${sessionFile}`);
+        assert.ok(
+          existsSync(sessionFile),
+          `Subagent session file should exist: ${sessionFile}`,
+        );
 
         const lines = readFileSync(sessionFile, "utf8").trim().split("\n");
-        assert.ok(lines.length >= 2, `Session should have ≥2 entries, got ${lines.length}`);
+        assert.ok(
+          lines.length >= 2,
+          `Session should have ≥2 entries, got ${lines.length}`,
+        );
 
         const header = JSON.parse(lines[0]);
-        assert.equal(header.type, "session", "First entry should be session header");
+        assert.equal(
+          header.type,
+          "session",
+          "First entry should be session header",
+        );
         assert.ok(header.id, "Session header should have an id");
       }
     });
@@ -162,7 +177,10 @@ for (const backend of backends) {
       );
 
       const content = await waitForFile(markerFile, PI_TIMEOUT, /STATUS_/);
-      assert.ok(content.includes(`STATUS_${id}`), `Marker file should contain STATUS_${id}`);
+      assert.ok(
+        content.includes(`STATUS_${id}`),
+        `Marker file should contain STATUS_${id}`,
+      );
 
       const completionScreen = await waitForScreen(
         surface,
@@ -209,8 +227,14 @@ for (const backend of backends) {
         waitForFile(fileB, PI_TIMEOUT, /DONE_B/),
       ]);
 
-      assert.ok(contentA.includes(`DONE_A_${id}`), `File A should contain marker`);
-      assert.ok(contentB.includes(`DONE_B_${id}`), `File B should contain marker`);
+      assert.ok(
+        contentA.includes(`DONE_A_${id}`),
+        `File A should contain marker`,
+      );
+      assert.ok(
+        contentB.includes(`DONE_B_${id}`),
+        `File B should contain marker`,
+      );
     });
 
     // ── Fork mode ──
@@ -236,7 +260,10 @@ for (const backend of backends) {
 
       // Verify: forked subagent created the file
       const content = await waitForFile(markerFile, PI_TIMEOUT, /FORK_OK/);
-      assert.ok(content.includes(`FORK_OK_${id}`), `Fork marker file should exist with content`);
+      assert.ok(
+        content.includes(`FORK_OK_${id}`),
+        `Fork marker file should exist with content`,
+      );
 
       // Wait for the outer pi to show the result
       const screen = await waitForScreen(
@@ -249,17 +276,30 @@ for (const backend of backends) {
       const sessionMatch = screen.match(/Session:\s*(\S+\.jsonl)/);
       if (sessionMatch) {
         const sessionFile = sessionMatch[1];
-        assert.ok(existsSync(sessionFile), `Fork session file should exist: ${sessionFile}`);
+        assert.ok(
+          existsSync(sessionFile),
+          `Fork session file should exist: ${sessionFile}`,
+        );
 
         const entries = readFileSync(sessionFile, "utf8")
           .trim()
           .split("\n")
           .map((l) => JSON.parse(l));
         const header = entries[0];
-        assert.equal(header.type, "session", "First entry should be session header");
-        assert.ok(header.parentSession, "Fork session should have parentSession field");
+        assert.equal(
+          header.type,
+          "session",
+          "First entry should be session header",
+        );
+        assert.ok(
+          header.parentSession,
+          "Fork session should have parentSession field",
+        );
         // Fork sessions include parent context (model_change entries etc.)
-        assert.ok(entries.length >= 2, "Fork session should have context entries beyond header");
+        assert.ok(
+          entries.length >= 2,
+          "Fork session should have context entries beyond header",
+        );
       }
     });
 
@@ -283,7 +323,11 @@ for (const backend of backends) {
 
       // The test-ping agent calls caller_ping, which steers a "needs help" message
       // back to the outer pi. Look for it on screen.
-      const screen = await waitForScreen(surface, /needs help|PING|caller_ping|ping/i, PI_TIMEOUT);
+      const screen = await waitForScreen(
+        surface,
+        /needs help|PING|caller_ping|ping/i,
+        PI_TIMEOUT,
+      );
 
       assert.ok(
         /needs help|PING/i.test(screen),
@@ -316,7 +360,10 @@ for (const backend of backends) {
 
       // The test-echo agent (discovered from project .pi/agents/) should work
       const content = await waitForFile(markerFile, PI_TIMEOUT, /DISCO/);
-      assert.ok(content.includes(`DISCO_${id}`), `Discovery test marker should exist`);
+      assert.ok(
+        content.includes(`DISCO_${id}`),
+        `Discovery test marker should exist`,
+      );
     });
 
     // ── Subagent with custom system prompt ──
@@ -341,7 +388,10 @@ for (const backend of backends) {
       startPi(surface, env.dir, task);
 
       const content = await waitForFile(markerFile, PI_TIMEOUT, /SYSPROMPT/);
-      assert.ok(content.includes(`SYSPROMPT_${id}`), `System prompt test marker should exist`);
+      assert.ok(
+        content.includes(`SYSPROMPT_${id}`),
+        `System prompt test marker should exist`,
+      );
     });
   });
 }
