@@ -89,7 +89,12 @@ export interface SubagentActivityRecorder {
   toolExecutionEnd(toolCallId?: string, toolName?: string): void;
   callerPing(): void;
   subagentDone(): void;
-  sessionShutdown(reason: SubagentShutdownReason): void;
+  /**
+   * Record shutdown. `reason` is only passed by callers that know why the
+   * session ended; pi's session_shutdown event carries no reason, in which
+   * case the recorder just stops writing without marking the phase done.
+   */
+  sessionShutdown(reason?: SubagentShutdownReason): void;
 }
 
 const ACTIVITY_UPDATE_THROTTLE_MS = 500;

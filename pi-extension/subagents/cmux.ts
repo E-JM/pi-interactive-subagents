@@ -23,9 +23,8 @@ export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm" | "herdr";
 const commandAvailability = new Map<string, boolean>();
 
 function hasCommand(command: string): boolean {
-  if (commandAvailability.has(command)) {
-    return commandAvailability.get(command)!;
-  }
+  const cached = commandAvailability.get(command);
+  if (cached !== undefined) return cached;
 
   let available = false;
   if (process.platform === "win32") {
@@ -241,21 +240,6 @@ function zellijActionSync(args: string[], surface?: string): string {
   });
 }
 
-async function _zellijActionAsync(
-  args: string[],
-  surface?: string,
-): Promise<string> {
-  const { stdout } = await execFileAsync(
-    "zellij",
-    zellijActionArgs(args, surface),
-    {
-      encoding: "utf8",
-      env: zellijEnv(surface),
-    },
-  );
-  return stdout;
-}
-
 /** Tracked subagent pane for cmux — reused across subagent launches. */
 let cmuxSubagentPane: string | null = null;
 
@@ -356,7 +340,11 @@ export function canSplitZellijPane(
 function zellijTabPanesForParent(
   panes: ZellijPaneSnapshot[],
   parentPaneId: number,
-): { parentPane: ZellijPaneSnapshot; tabPanes: ZellijPaneSnapshot[] } | null {
+): {
+  parentPane: ZellijPaneSnapshot;
+  tabId: number;
+  tabPanes: ZellijPaneSnapshot[];
+} | null {
   const parentPane = panes.find(
     (pane) => !pane.is_plugin && pane.id === parentPaneId,
   );
@@ -366,7 +354,7 @@ function zellijTabPanesForParent(
     .filter((pane) => pane.tab_id === parentPane.tab_id)
     .filter(isUsableZellijTiledPane);
 
-  return { parentPane, tabPanes };
+  return { parentPane, tabId: parentPane.tab_id, tabPanes };
 }
 
 export function selectZellijStackPlacement(
@@ -385,7 +373,7 @@ export function selectZellijStackPlacement(
     mode: "stack",
     anchorPaneId: stackTarget.id,
     targetPaneId: stackTarget.id,
-    tabId: tabInfo.parentPane.tab_id!,
+    tabId: tabInfo.tabId,
   };
 }
 
@@ -435,12 +423,17 @@ export function selectZellijPlacement(
       mode: "split",
       anchorPaneId: splitTarget.pane.id,
       targetPaneId: splitTarget.pane.id,
-      tabId: tabInfo.parentPane.tab_id!,
+      tabId: tabInfo.tabId,
       splitDirection: splitTarget.splitDirection,
     };
   }
 
   return selectZellijStackPlacement(panes, parentPaneId);
+}
+
+/** Synchronous sleep that blocks the event loop (safe inside sync CLI flows). */
+function sleepSync(milliseconds: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
 }
 
 function parseZellijPaneSurface(rawId: string, context: string): string {
@@ -558,10 +551,6 @@ function envPositiveInteger(name: string, fallback: number): number {
   return Number.isInteger(value) && value > 0 ? value : fallback;
 }
 
-function sleepSync(milliseconds: number): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
-}
-
 function zellijSurfaceLockPath(): string {
   const session = (
     process.env.ZELLIJ_SESSION_NAME ??
@@ -662,15 +651,20 @@ function nonEmptyString(value: unknown): value is string {
   return typeof value === "string" && value.length > 0;
 }
 
-export function parseCmuxFocusedSnapshot(
+/**
+ * Read `{ [key]: { surface_ref?, pane_ref? } }` from a parsed cmux identify
+ * payload, rejecting entries without at least one usable ref.
+ */
+function parseCmuxFocusSnapshotField(
   value: unknown,
+  key: "focused" | "caller",
 ): CmuxFocusSnapshot | null {
   if (!value || typeof value !== "object") return null;
 
-  const focused = (value as { focused?: unknown }).focused;
-  if (!focused || typeof focused !== "object") return null;
+  const field = (value as Record<string, unknown>)[key];
+  if (!field || typeof field !== "object") return null;
 
-  const record = focused as { surface_ref?: unknown; pane_ref?: unknown };
+  const record = field as { surface_ref?: unknown; pane_ref?: unknown };
   const surfaceRef = nonEmptyString(record.surface_ref)
     ? record.surface_ref
     : undefined;
@@ -680,11 +674,16 @@ export function parseCmuxFocusedSnapshot(
   return { surfaceRef, paneRef };
 }
 
-export function parseCmuxJson(value: string): unknown | null {
+export function parseCmuxFocusedSnapshot(
+  value: unknown,
+): CmuxFocusSnapshot | null {
+  return parseCmuxFocusSnapshotField(value, "focused");
+}
+
+export function parseCmuxJson(value: string): unknown {
   try {
     return JSON.parse(value);
-  } catch (error) {
-    void error;
+  } catch {
     return null;
   }
 }
@@ -696,19 +695,7 @@ export function parseCmuxFocusedSnapshotFromJson(
 }
 
 function parseCmuxCallerSnapshot(value: unknown): CmuxFocusSnapshot | null {
-  if (!value || typeof value !== "object") return null;
-
-  const caller = (value as { caller?: unknown }).caller;
-  if (!caller || typeof caller !== "object") return null;
-
-  const record = caller as { surface_ref?: unknown; pane_ref?: unknown };
-  const surfaceRef = nonEmptyString(record.surface_ref)
-    ? record.surface_ref
-    : undefined;
-  const paneRef = nonEmptyString(record.pane_ref) ? record.pane_ref : undefined;
-
-  if (!surfaceRef && !paneRef) return null;
-  return { surfaceRef, paneRef };
+  return parseCmuxFocusSnapshotField(value, "caller");
 }
 
 export function parseCmuxPaneRefForSurface(
@@ -789,8 +776,9 @@ function restoreCmuxFocusSnapshot(snapshot: CmuxFocusSnapshot | null): void {
   }
 }
 
+/** Give cmux a moment to apply focus changes before reading focus back. */
 function waitForCmuxFocusSettle(): void {
-  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+  sleepSync(100);
 }
 
 function cmuxFocusMatchesChild(
@@ -2991,23 +2979,39 @@ export interface PollResult {
   errorMessage?: string;
 }
 
+/** Shape of the `.exit` sidecar JSON written by the child extension. */
+interface ExitSidecarPayload {
+  type?: unknown;
+  name?: unknown;
+  message?: unknown;
+  errorMessage?: unknown;
+}
+
 /**
  * Interpret an `.exit` sidecar payload (written by subagent_done / caller_ping /
  * the error path in subagent-done.ts). Centralized so both the fast and slow
  * paths in pollForExit decode the payload the same way.
  */
-function interpretExitSidecar(data: any): PollResult {
-  if (data?.type === "ping") {
+function interpretExitSidecar(data: unknown): PollResult {
+  const payload = (
+    typeof data === "object" && data !== null ? data : {}
+  ) as ExitSidecarPayload;
+
+  if (payload.type === "ping") {
     return {
       reason: "ping",
       exitCode: 0,
-      ping: { name: data.name, message: data.message },
+      ping: {
+        name: typeof payload.name === "string" ? payload.name : "subagent",
+        message: typeof payload.message === "string" ? payload.message : "",
+      },
     };
   }
-  if (data?.type === "error") {
+  if (payload.type === "error") {
     const errorMessage =
-      typeof data.errorMessage === "string" && data.errorMessage.trim() !== ""
-        ? data.errorMessage
+      typeof payload.errorMessage === "string" &&
+      payload.errorMessage.trim() !== ""
+        ? payload.errorMessage
         : "Subagent exited with stopReason=error (no errorMessage in sidecar).";
     return { reason: "error", exitCode: 1, errorMessage };
   }

@@ -260,7 +260,7 @@ export function createStatusState(params: {
     phase: null,
     latestEvent: null,
     activityLabel: null,
-    snapshotState: params.source === "claude" ? "unseen" : "unseen",
+    snapshotState: "unseen",
     snapshotProblemSinceMs: null,
     snapshotError: null,
     currentKind: initialKind,

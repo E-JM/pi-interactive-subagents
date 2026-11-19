@@ -81,26 +81,31 @@ const WIDGET_INTERVAL_KEY = Symbol.for("pi-subagents/widget-interval");
 const STATUS_INTERVAL_KEY = Symbol.for("pi-subagents/status-interval");
 const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
 
+/** Symbol-keyed store for state that must survive /reload. */
+const globalStore = globalThis as Record<symbol, unknown>;
+
 {
-  const prevInterval = (globalThis as any)[WIDGET_INTERVAL_KEY];
+  const prevInterval = globalStore[WIDGET_INTERVAL_KEY] as
+    | ReturnType<typeof setInterval>
+    | undefined;
   if (prevInterval) {
     clearInterval(prevInterval);
-    (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
+    globalStore[WIDGET_INTERVAL_KEY] = null;
   }
-  const prevStatusInterval = (globalThis as any)[STATUS_INTERVAL_KEY];
+  const prevStatusInterval = globalStore[STATUS_INTERVAL_KEY] as
+    | ReturnType<typeof setInterval>
+    | undefined;
   if (prevStatusInterval) {
     clearInterval(prevStatusInterval);
-    (globalThis as any)[STATUS_INTERVAL_KEY] = null;
+    globalStore[STATUS_INTERVAL_KEY] = null;
   }
-  const prevAbort = (globalThis as any)[POLL_ABORT_KEY] as
-    | AbortController
-    | undefined;
+  const prevAbort = globalStore[POLL_ABORT_KEY] as AbortController | undefined;
   if (prevAbort) prevAbort.abort();
-  (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
+  globalStore[POLL_ABORT_KEY] = new AbortController();
 }
 
 function getModuleAbortSignal(): AbortSignal {
-  return ((globalThis as any)[POLL_ABORT_KEY] as AbortController).signal;
+  return (globalStore[POLL_ABORT_KEY] as AbortController).signal;
 }
 
 const SubagentParams = Type.Object({
@@ -220,6 +225,26 @@ function resolveDenyTools(agentDefs: AgentDefaults | null): Set<string> {
   }
 
   return denied;
+}
+
+/**
+ * Filesystem-safe name fragment for generated artifacts: lowercase,
+ * hyphen-separated, stripped of special characters, with a fallback when the
+ * result would be empty.
+ */
+function safeFileName(name: string, fallback: string): string {
+  const slug = name
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, "")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+  return slug || fallback;
+}
+
+/** Timestamp fragment safe for file names, e.g. `2026-01-02T03-04-05`. */
+function fileTimestamp(): string {
+  return new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
 }
 
 /** Resolve the global agent config directory, respecting PI_CODING_AGENT_DIR. */
@@ -436,6 +461,12 @@ function formatElapsed(seconds: number): string {
   const m = Math.floor(seconds / 60);
   const s = seconds % 60;
   return `${m}m ${s}s`;
+}
+
+/** Human-readable message for an unknown thrown value. */
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return String(error);
 }
 
 /**
@@ -692,14 +723,14 @@ function updateWidget() {
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
-      (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
+      globalStore[WIDGET_INTERVAL_KEY] = null;
     }
     return;
   }
 
   latestCtx.ui.setWidget(
     "subagent-status",
-    (_tui: any, _theme: any) => {
+    (_tui, _theme) => {
       return {
         invalidate() {},
         render(width: number) {
@@ -863,12 +894,12 @@ function requestSubagentInterrupt(
   try {
     sendEscapeKey(running.surface);
     return { ok: true };
-  } catch (error: any) {
+  } catch (error) {
     const backend = getMuxBackend() ?? "unknown";
     return {
       error:
         `Failed to send Escape to subagent "${running.name}" via ${backend}: ` +
-        `${error?.message ?? String(error)}`,
+        `${errorMessage(error)}`,
     };
   }
 }
@@ -943,7 +974,7 @@ function startStatusRefresh(pi: ExtensionAPI) {
       if (statusInterval) {
         clearInterval(statusInterval);
         statusInterval = null;
-        (globalThis as any)[STATUS_INTERVAL_KEY] = null;
+        globalStore[STATUS_INTERVAL_KEY] = null;
       }
       return;
     }
@@ -991,7 +1022,7 @@ function startStatusRefresh(pi: ExtensionAPI) {
     }
   }, 1000);
 
-  (globalThis as any)[STATUS_INTERVAL_KEY] = statusInterval;
+  globalStore[STATUS_INTERVAL_KEY] = statusInterval;
 }
 
 function resolveResumeLaunchBehavior(params: { autoExit?: boolean }): {
@@ -1001,6 +1032,30 @@ function resolveResumeLaunchBehavior(params: { autoExit?: boolean }): {
   const autoExit = params.autoExit ?? true;
   return { autoExit, interactive: !autoExit };
 }
+
+// Tool descriptions, shared verbatim between `description` (tooltip) and
+// `promptSnippet` (system prompt) so the two never drift apart. Kept short:
+// they are injected into every session's prompt.
+const SUBAGENT_DESCRIPTION =
+  "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
+  "Fire-and-forget: returns immediately with only an acknowledgement; the result " +
+  "arrives later as an automatic steer message that starts a new turn. " +
+  "Never poll, sleep/wait, or assume/fabricate results — the harness handles delivery. " +
+  "After spawning, end your turn or do other independent work (parallel spawns are fine).";
+
+const SUBAGENT_INTERRUPT_DESCRIPTION =
+  "Send Escape to the active turn of a running Pi-backed subagent. " +
+  "The child pane, session, and watcher stay alive; this only acknowledges the request.";
+
+const SUBAGENTS_LIST_DESCRIPTION =
+  "List available subagent definitions from project .pi/agents/ and global " +
+  "~/.pi/agent/agents/. Project-local agents override global ones with the same name.";
+
+const SUBAGENT_RESUME_DESCRIPTION =
+  "Resume a previous sub-agent session in a new multiplexer pane. " +
+  "Fire-and-forget: returns immediately; the result arrives later as an automatic " +
+  "steer message. Never poll or assume results — end your turn or do other " +
+  "independent work after resuming. Use for cancelled runs or follow-up work.";
 
 export const __test__ = {
   borderLine,
@@ -1025,13 +1080,45 @@ export const __test__ = {
   formatElapsed,
 };
 
+/**
+ * Loose view of the `details` payloads this extension attaches to custom
+ * messages and tool results. The pi API types them only as opaque records,
+ * so renderers narrow them through this interface.
+ */
+interface SubagentDetailsPayload {
+  name?: string;
+  id?: string;
+  agent?: string;
+  status?: string;
+  error?: string;
+  exitCode?: number;
+  elapsed?: number;
+  errorMessage?: string;
+  sessionFile?: string;
+  message?: string;
+  agents?: Array<{
+    name: string;
+    source?: AgentSource;
+    description?: string;
+    model?: string;
+  }>;
+  lines?: string[];
+  overflow?: number;
+}
+
+function detailsOf(value: unknown): SubagentDetailsPayload {
+  return (
+    typeof value === "object" && value !== null ? value : {}
+  ) as SubagentDetailsPayload;
+}
+
 function startWidgetRefresh() {
   if (widgetInterval) return;
   updateWidget(); // immediate first render
   widgetInterval = setInterval(() => {
     updateWidget();
   }, 1000);
-  (globalThis as any)[WIDGET_INTERVAL_KEY] = widgetInterval;
+  globalStore[WIDGET_INTERVAL_KEY] = widgetInterval;
 }
 
 /**
@@ -1041,7 +1128,7 @@ function startWidgetRefresh() {
  * Call watchSubagent() on the returned object to observe completion.
  */
 async function launchSubagent(
-  params: typeof SubagentParams.static,
+  params: Static<typeof SubagentParams>,
   ctx: {
     sessionManager: {
       getSessionFile(): string | null;
@@ -1162,18 +1249,10 @@ async function launchSubagent(
     const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
     const command = `${cdPrefix}${cmdParts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
 
-    const launchScriptName = `${
-      (params.name || "subagent")
-        .toLowerCase()
-        .replace(/[^a-z0-9\s-]/g, "")
-        .replace(/\s+/g, "-")
-        .replace(/-+/g, "-")
-        .replace(/^-|-$/g, "") || "subagent"
-    }-${id}.sh`;
     const launchScriptFile = join(
       artifactDir,
       "subagent-scripts",
-      launchScriptName,
+      `${safeFileName(params.name, "subagent")}-${id}.sh`,
     );
 
     sendLongCommand(surface, command, {
@@ -1233,19 +1312,9 @@ async function launchSubagent(
       systemPromptMode === "replace"
         ? "--system-prompt"
         : "--append-system-prompt";
-    const spTimestamp = new Date()
-      .toISOString()
-      .replace(/[:.]/g, "-")
-      .slice(0, 19);
-    const spSafeName = params.name
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, "")
-      .replace(/\s+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "");
     const syspromptPath = join(
       artifactDir,
-      `context/${spSafeName || "subagent"}-sysprompt-${spTimestamp}.md`,
+      `context/${safeFileName(params.name, "subagent")}-sysprompt-${fileTimestamp()}.md`,
     );
     mkdirSync(dirname(syspromptPath), { recursive: true });
     writeFileSync(syspromptPath, identity, "utf8");
@@ -1291,17 +1360,7 @@ async function launchSubagent(
   if (launchBehavior.taskDelivery === "direct") {
     taskArg = fullTask;
   } else {
-    const timestamp = new Date()
-      .toISOString()
-      .replace(/[:.]/g, "-")
-      .slice(0, 19);
-    const safeName = params.name
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, "") // strip everything except alphanumeric, spaces, hyphens
-      .replace(/\s+/g, "-") // spaces to hyphens
-      .replace(/-+/g, "-") // collapse multiple hyphens
-      .replace(/^-|-$/g, ""); // trim leading/trailing hyphens
-    const artifactName = `context/${safeName || "subagent"}-${timestamp}.md`;
+    const artifactName = `context/${safeFileName(params.name, "subagent")}-${fileTimestamp()}.md`;
     const artifactPath = join(artifactDir, artifactName);
     mkdirSync(dirname(artifactPath), { recursive: true });
     writeFileSync(artifactPath, fullTask, "utf8");
@@ -1321,18 +1380,10 @@ async function launchSubagent(
 
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
   const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
-  const launchScriptName = `${
-    (params.name || "subagent")
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, "")
-      .replace(/\s+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "") || "subagent"
-  }-${id}.sh`;
   const launchScriptFile = join(
     artifactDir,
     "subagent-scripts",
-    launchScriptName,
+    `${safeFileName(params.name, "subagent")}-${id}.sh`,
   );
   sendLongCommand(surface, command, {
     scriptPath: launchScriptFile,
@@ -1497,7 +1548,8 @@ async function watchSubagent(
       ping: result.ping,
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
     };
-  } catch (err: any) {
+  } catch (err) {
+    const message = errorMessage(err);
     try {
       closeSurface(surface);
     } catch {}
@@ -1517,10 +1569,10 @@ async function watchSubagent(
     return {
       name,
       task,
-      summary: `Subagent error: ${err?.message ?? String(err)}`,
+      summary: `Subagent error: ${message}`,
       exitCode: 1,
       elapsed: Math.floor((Date.now() - startTime) / 1000),
-      error: err?.message ?? String(err),
+      error: message,
     };
   }
 }
@@ -1586,14 +1638,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
-      (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
+      globalStore[WIDGET_INTERVAL_KEY] = null;
     }
     if (statusInterval) {
       clearInterval(statusInterval);
       statusInterval = null;
-      (globalThis as any)[STATUS_INTERVAL_KEY] = null;
+      globalStore[STATUS_INTERVAL_KEY] = null;
     }
-    const moduleAbort = (globalThis as any)[POLL_ABORT_KEY] as
+    const moduleAbort = globalStore[POLL_ABORT_KEY] as
       | AbortController
       | undefined;
     if (moduleAbort) moduleAbort.abort();
@@ -1617,20 +1669,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     pi.registerTool({
       name: "subagent",
       label: "Subagent",
-      description:
-        "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
-        "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
-        "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
-        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
-        "DO NOT fabricate, assume, or summarize results after calling this tool. " +
-        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
-      promptSnippet:
-        "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
-        "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
-        "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
-        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
-        "DO NOT fabricate, assume, or summarize results after calling this tool. " +
-        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
+      description: SUBAGENT_DESCRIPTION,
+      promptSnippet: SUBAGENT_DESCRIPTION,
       parameters: SubagentParams,
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -1735,12 +1775,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             pi.sendMessage(
               {
                 customType: "subagent_result",
-                content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
+                content: `Sub-agent "${running.name}" error: ${errorMessage(err)}`,
                 display: true,
                 details: {
                   name: running.name,
                   task: running.task,
-                  error: err?.message,
+                  error: errorMessage(err),
                 },
               },
               { triggerTurn: true, deliverAs: "steer" },
@@ -1810,11 +1850,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
 
       renderResult(result, _opts, theme) {
-        const details = result.details as any;
-        const name = details?.name ?? "(unnamed)";
+        const details = detailsOf(result.details);
+        const name = details.name ?? "(unnamed)";
 
         // "Started" result — tool returned immediately
-        if (details?.status === "started") {
+        if (details.status === "started") {
           return new Text(
             theme.fg("accent", "▸") +
               " " +
@@ -1838,14 +1878,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     pi.registerTool({
       name: "subagent_interrupt",
       label: "Interrupt Subagent",
-      description:
-        "Send Escape to the active turn of a currently running Pi-backed subagent. " +
-        "The child pane, session, watcher, and running entry remain alive; this returns only a local acknowledgement " +
-        "and does not emit a subagent_result solely because of this request.",
-      promptSnippet:
-        "Send Escape to the active turn of a currently running Pi-backed subagent. " +
-        "The child pane, session, watcher, and running entry remain alive; this returns only a local acknowledgement " +
-        "and does not emit a subagent_result solely because of this request.",
+      description: SUBAGENT_INTERRUPT_DESCRIPTION,
+      promptSnippet: SUBAGENT_INTERRUPT_DESCRIPTION,
       parameters: Type.Object({
         id: Type.Optional(
           Type.String({ description: "Exact running subagent id" }),
@@ -1872,8 +1906,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
 
       renderResult(result, _opts, theme) {
-        const details = result.details as any;
-        if (details?.status === "interrupt_requested") {
+        const details = detailsOf(result.details);
+        if (details.status === "interrupt_requested") {
           return new Text(
             theme.fg("accent", "▸") +
               " " +
@@ -1899,14 +1933,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     pi.registerTool({
       name: "subagents_list",
       label: "List Subagents",
-      description:
-        "List all available subagent definitions. " +
-        "Scans project-local .pi/agents/ and global ~/.pi/agent/agents/. " +
-        "Project-local agents override global ones with the same name.",
-      promptSnippet:
-        "List all available subagent definitions. " +
-        "Scans project-local .pi/agents/ and global ~/.pi/agent/agents/. " +
-        "Project-local agents override global ones with the same name.",
+      description: SUBAGENTS_LIST_DESCRIPTION,
+      promptSnippet: SUBAGENTS_LIST_DESCRIPTION,
       parameters: Type.Object({}),
 
       async execute() {
@@ -1935,8 +1963,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
 
       renderResult(result, _opts, theme) {
-        const details = result.details as any;
-        const agents = details?.agents ?? [];
+        const details = detailsOf(result.details);
+        const agents = details.agents ?? [];
         if (agents.length === 0) {
           return new Text(
             theme.fg("dim", "No subagent definitions found."),
@@ -1944,7 +1972,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             0,
           );
         }
-        const lines = agents.map((a: any) => {
+        const lines = agents.map((a) => {
           const badge =
             a.source === "project" ? theme.fg("accent", " (project)") : "";
           const desc = a.description
@@ -1961,20 +1989,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     pi.registerTool({
       name: "subagent_resume",
       label: "Resume Subagent",
-      description:
-        "Resume a previous sub-agent session in a new multiplexer pane. " +
-        "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
-        "When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
-        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
-        "DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when the result is ready. " +
-        "Use when a sub-agent was cancelled or needs follow-up work.",
-      promptSnippet:
-        "Resume a previous sub-agent session in a new multiplexer pane. " +
-        "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
-        "When the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
-        "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT poll for status. All of that is wasted work — the harness handles delivery for you. " +
-        "DO NOT fabricate or assume results. After resuming, either end your turn or work on other independent tasks; the harness will wake you when the result is ready. " +
-        "Use when a sub-agent was cancelled or needs follow-up work.",
+      description: SUBAGENT_RESUME_DESCRIPTION,
+      promptSnippet: SUBAGENT_RESUME_DESCRIPTION,
       parameters: Type.Object({
         sessionPath: Type.String({
           description: "Path to the session .jsonl file to resume",
@@ -2008,10 +2024,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
 
       renderResult(result, _opts, theme) {
-        const details = result.details as any;
-        const name = details?.name ?? "Resume";
+        const details = detailsOf(result.details);
+        const name = details.name ?? "Resume";
 
-        if (details?.status === "started") {
+        if (details.status === "started") {
           return new Text(
             theme.fg("accent", "▸") +
               " " +
@@ -2082,21 +2098,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         let resumeMsgFile: string | undefined;
         if (params.message) {
-          const msgTimestamp = new Date()
-            .toISOString()
-            .replace(/[:.]/g, "-")
-            .slice(0, 19);
           resumeMsgFile = join(
             artifactDir,
             "subagent-resume",
-            `${
-              name
-                .toLowerCase()
-                .replace(/[^a-z0-9\s-]/g, "")
-                .replace(/\s+/g, "-")
-                .replace(/-+/g, "-")
-                .replace(/^-|-$/g, "") || "resume"
-            }-${msgTimestamp}.md`,
+            `${safeFileName(name, "resume")}-${fileTimestamp()}.md`,
           );
           mkdirSync(dirname(resumeMsgFile), { recursive: true });
           writeFileSync(resumeMsgFile, params.message, "utf8");
@@ -2127,14 +2132,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",
-          `${
-            name
-              .toLowerCase()
-              .replace(/[^a-z0-9\s-]/g, "")
-              .replace(/\s+/g, "-")
-              .replace(/-+/g, "-")
-              .replace(/^-|-$/g, "") || "resume"
-          }-resume-${Date.now()}.sh`,
+          `${safeFileName(name, "resume")}-resume-${Date.now()}.sh`,
         );
         sendLongCommand(surface, command, {
           scriptPath: launchScriptFile,
@@ -2235,9 +2233,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             pi.sendMessage(
               {
                 customType: "subagent_result",
-                content: `Resume error: ${err?.message ?? String(err)}`,
+                content: `Resume error: ${errorMessage(err)}`,
                 display: true,
-                details: { name, error: err?.message },
+                details: { name, error: errorMessage(err) },
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
@@ -2336,23 +2334,23 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   });
 
   pi.registerMessageRenderer("subagent_result", (message, options, theme) => {
-    const details = message.details as any;
-    if (!details) return undefined;
+    if (message.details == null) return undefined;
+    const details = detailsOf(message.details);
 
     return {
       render(width: number): string[] {
         const name = details.name ?? "subagent";
         const exitCode = details.exitCode ?? 0;
-        const errorMessage =
+        const errorText =
           typeof details.errorMessage === "string" ? details.errorMessage : "";
-        const failed = exitCode !== 0 || !!errorMessage;
+        const failed = exitCode !== 0 || !!errorText;
         const elapsed =
           details.elapsed != null ? formatElapsed(details.elapsed) : "?";
         const bgFn = failed
           ? (text: string) => theme.bg("toolErrorBg", text)
           : (text: string) => theme.bg("toolSuccessBg", text);
         const icon = failed ? theme.fg("error", "✗") : theme.fg("success", "✓");
-        const status = errorMessage
+        const status = errorText
           ? "failed (provider/agent error)"
           : failed
             ? `failed (exit ${exitCode})`
@@ -2427,10 +2425,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   });
 
   pi.registerMessageRenderer("subagent_status", (message, options, theme) => {
-    const details = message.details as any;
-    const lines = Array.isArray(details?.lines) ? details.lines : [];
+    const details = detailsOf(message.details);
+    const lines = Array.isArray(details.lines) ? details.lines : [];
     const overflow =
-      typeof details?.overflow === "number" ? details.overflow : 0;
+      typeof details.overflow === "number" ? details.overflow : 0;
     if (lines.length === 0 && overflow === 0) return undefined;
 
     return {
@@ -2462,8 +2460,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   });
 
   pi.registerMessageRenderer("subagent_ping", (message, options, theme) => {
-    const details = message.details as any;
-    if (!details) return undefined;
+    if (message.details == null) return undefined;
+    const details = detailsOf(message.details);
 
     return {
       render(width: number): string[] {

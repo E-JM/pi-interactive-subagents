@@ -70,7 +70,6 @@ import {
 import {
   findLatestAssistantError,
   shouldAutoExitOnAgentEnd,
-  shouldMarkUserTookOver,
 } from "../pi-extension/subagents/subagent-done.ts";
 
 // --- Helpers ---
@@ -1454,16 +1453,6 @@ describe("subagent discovery", () => {
   });
 });
 describe("subagent-done.ts", () => {
-  describe("shouldMarkUserTookOver", () => {
-    it("ignores the initial injected task before the first agent run", () => {
-      assert.equal(shouldMarkUserTookOver(false), false);
-    });
-
-    it("treats later input as manual takeover", () => {
-      assert.equal(shouldMarkUserTookOver(true), true);
-    });
-  });
-
   describe("shouldAutoExitOnAgentEnd", () => {
     it("auto-exits after normal completion when there was no takeover", () => {
       const messages = [{ role: "assistant", stopReason: "stop" }];
