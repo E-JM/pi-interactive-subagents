@@ -11,10 +11,20 @@ const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const DEFAULT_STATUS_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
 const STATUS_CONFIG_EXAMPLE_PATH = join(PACKAGE_ROOT, "config.json.example");
 
-export type SubagentStatusKind = "starting" | "active" | "waiting" | "stalled" | "running";
+export type SubagentStatusKind =
+  | "starting"
+  | "active"
+  | "waiting"
+  | "stalled"
+  | "running";
 export type SubagentStatusSource = "pi" | "claude";
 export type SubagentStatusTransition = "stalled" | "recovered" | null;
-export type StatusSnapshotState = "unseen" | "present" | "missing" | "invalid" | "wrong-id";
+export type StatusSnapshotState =
+  | "unseen"
+  | "present"
+  | "missing"
+  | "invalid"
+  | "wrong-id";
 export type StatusActivityPhase = "starting" | "active" | "waiting" | "done";
 
 export interface StatusConfig {
@@ -87,14 +97,22 @@ function invalidStatusConfig(source: string, message: string): never {
   throw new Error(`Invalid subagent status config in ${source}: ${message}`);
 }
 
-function requireObject(value: unknown, source: string, fieldName: string): Record<string, unknown> {
+function requireObject(
+  value: unknown,
+  source: string,
+  fieldName: string,
+): Record<string, unknown> {
   if (value == null || typeof value !== "object" || Array.isArray(value)) {
     invalidStatusConfig(source, `${fieldName} must be an object`);
   }
   return value as Record<string, unknown>;
 }
 
-function requireBoolean(value: unknown, source: string, fieldName: string): boolean {
+function requireBoolean(
+  value: unknown,
+  source: string,
+  fieldName: string,
+): boolean {
   if (typeof value !== "boolean") {
     invalidStatusConfig(source, `${fieldName} must be a boolean`);
   }
@@ -107,7 +125,9 @@ function rejectUnsupportedKeys(
   source: string,
   fieldName: string,
 ): void {
-  const unsupportedKeys = Object.keys(value).filter((key) => !allowedKeys.includes(key));
+  const unsupportedKeys = Object.keys(value).filter(
+    (key) => !allowedKeys.includes(key),
+  );
   if (unsupportedKeys.length > 0) {
     invalidStatusConfig(
       source,
@@ -131,7 +151,9 @@ function boundStatusLine(line: string): string {
   return truncateText(line.replace(/\s+/g, " ").trim(), MAX_STATUS_LINE_LENGTH);
 }
 
-function snapshotProblemLabel(snapshotState: StatusSnapshotState): string | null {
+function snapshotProblemLabel(
+  snapshotState: StatusSnapshotState,
+): string | null {
   if (snapshotState === "wrong-id") return "wrong activity id";
   return null;
 }
@@ -142,7 +164,10 @@ function activityLabel(
   return snapshot.activityLabel ?? snapshot.activeScope;
 }
 
-export function parseStatusConfig(rawConfig: unknown, source = "config.json"): StatusConfig {
+export function parseStatusConfig(
+  rawConfig: unknown,
+  source = "config.json",
+): StatusConfig {
   const config = requireObject(rawConfig, source, "root");
   const status = requireObject(config.status, source, "status");
   rejectUnsupportedKeys(status, ["enabled"], source, "status");
@@ -159,18 +184,26 @@ function readStatusConfigFile(
   examplePath: string,
 ): { sourcePath: string; rawConfig: string } {
   try {
-    return { sourcePath: configPath, rawConfig: readFileSync(configPath, "utf8") };
+    return {
+      sourcePath: configPath,
+      rawConfig: readFileSync(configPath, "utf8"),
+    };
   } catch (error) {
     const errno = error as NodeJS.ErrnoException;
     if (errno.code !== "ENOENT") throw error;
   }
 
   try {
-    return { sourcePath: examplePath, rawConfig: readFileSync(examplePath, "utf8") };
+    return {
+      sourcePath: examplePath,
+      rawConfig: readFileSync(examplePath, "utf8"),
+    };
   } catch (error) {
     const errno = error as NodeJS.ErrnoException;
     if (errno.code === "ENOENT") {
-      throw new Error(`Missing subagent status config. Expected ${configPath} or ${examplePath}.`);
+      throw new Error(
+        `Missing subagent status config. Expected ${configPath} or ${examplePath}.`,
+      );
     }
     throw error;
   }
@@ -180,7 +213,10 @@ export function loadStatusConfig(
   configPath = DEFAULT_STATUS_CONFIG_PATH,
   examplePath = STATUS_CONFIG_EXAMPLE_PATH,
 ): StatusConfig {
-  const { sourcePath, rawConfig } = readStatusConfigFile(configPath, examplePath);
+  const { sourcePath, rawConfig } = readStatusConfigFile(
+    configPath,
+    examplePath,
+  );
 
   let parsed: unknown;
   try {
@@ -224,7 +260,7 @@ export function createStatusState(params: {
     phase: null,
     latestEvent: null,
     activityLabel: null,
-    snapshotState: params.source === "claude" ? "unseen" : "unseen",
+    snapshotState: "unseen",
     snapshotProblemSinceMs: null,
     snapshotError: null,
     currentKind: initialKind,
@@ -274,7 +310,9 @@ export function observeStatus(
     ? (observation.activeSince ?? state.activeSinceMs ?? updatedAt)
     : null;
   const waitingSinceMs =
-    phase === "waiting" ? (observation.waitingSince ?? state.waitingSinceMs ?? updatedAt) : null;
+    phase === "waiting"
+      ? (observation.waitingSince ?? state.waitingSinceMs ?? updatedAt)
+      : null;
 
   return {
     ...state,
@@ -339,7 +377,8 @@ function classifyProblemState(
 
   const problemSinceMs = state.snapshotProblemSinceMs ?? now;
   const problemMs = Math.max(0, now - problemSinceMs);
-  if (problemMs >= SNAPSHOT_STALLED_AFTER_MS) return { kind: "stalled", statusLabel: problemLabel };
+  if (problemMs >= SNAPSHOT_STALLED_AFTER_MS)
+    return { kind: "stalled", statusLabel: problemLabel };
 
   const lastHealthyKind = state.activeNow
     ? "active"
@@ -351,7 +390,10 @@ function classifyProblemState(
   return { kind: lastHealthyKind, statusLabel: problemLabel };
 }
 
-export function classifyStatus(state: SubagentStatusState, now: number): StatusSnapshot {
+export function classifyStatus(
+  state: SubagentStatusState,
+  now: number,
+): StatusSnapshot {
   const elapsedMs = Math.max(0, now - state.startTimeMs);
   const elapsedText = formatElapsedDuration(elapsedMs);
 
@@ -388,7 +430,10 @@ export function classifyStatus(state: SubagentStatusState, now: number): StatusS
     } else {
       const referenceMs = state.firstObservationAtMs ?? state.startTimeMs;
       const elapsedSinceObservationMs = Math.max(0, now - referenceMs);
-      kind = elapsedSinceObservationMs >= SNAPSHOT_STALLED_AFTER_MS ? "stalled" : "starting";
+      kind =
+        elapsedSinceObservationMs >= SNAPSHOT_STALLED_AFTER_MS
+          ? "stalled"
+          : "starting";
       statusLabel = null;
     }
   } else {
@@ -398,9 +443,13 @@ export function classifyStatus(state: SubagentStatusState, now: number): StatusS
   }
 
   const activeDurationText =
-    state.activeSinceMs == null ? null : formatElapsedDuration(now - state.activeSinceMs);
+    state.activeSinceMs == null
+      ? null
+      : formatElapsedDuration(now - state.activeSinceMs);
   const waitingDurationText =
-    state.waitingSinceMs == null ? null : formatElapsedDuration(now - state.waitingSinceMs);
+    state.waitingSinceMs == null
+      ? null
+      : formatElapsedDuration(now - state.waitingSinceMs);
   const snapshotProblemText =
     state.snapshotProblemSinceMs == null
       ? null
@@ -454,27 +503,38 @@ export function advanceStatusState(
 function formatActiveDetail(snapshot: StatusSnapshot): string {
   const label = activityLabel(snapshot);
   if (!label) return "active";
-  const duration = snapshot.activeDurationText ? ` ${snapshot.activeDurationText}` : "";
+  const duration = snapshot.activeDurationText
+    ? ` ${snapshot.activeDurationText}`
+    : "";
   return `active (${label}${duration})`;
 }
 
 function formatWaitingDetail(snapshot: StatusSnapshot): string {
-  const duration = snapshot.waitingDurationText ? ` ${snapshot.waitingDurationText}` : "";
+  const duration = snapshot.waitingDurationText
+    ? ` ${snapshot.waitingDurationText}`
+    : "";
   return `waiting${duration}`;
 }
 
 function formatStalledDetail(snapshot: StatusSnapshot): string {
   const detail = snapshot.statusLabel ? ` (${snapshot.statusLabel})` : "";
-  const duration = snapshot.snapshotProblemText ? ` ${snapshot.snapshotProblemText}` : "";
+  const duration = snapshot.snapshotProblemText
+    ? ` ${snapshot.snapshotProblemText}`
+    : "";
   return `stalled${duration}${detail}`;
 }
 
-export function formatStatusLine(name: string, snapshot: StatusSnapshot): string {
+export function formatStatusLine(
+  name: string,
+  snapshot: StatusSnapshot,
+): string {
   const boundedName = normalizeStatusName(name);
 
   if (snapshot.kind === "starting") {
     const label = snapshot.statusLabel ? ` (${snapshot.statusLabel})` : "";
-    return boundStatusLine(`${boundedName} running ${snapshot.elapsedText}, starting${label}.`);
+    return boundStatusLine(
+      `${boundedName} running ${snapshot.elapsedText}, starting${label}.`,
+    );
   }
 
   if (snapshot.kind === "running") {
@@ -513,14 +573,21 @@ export function formatTransitionLine(
 
   if (transition === "recovered") {
     const detail =
-      snapshot.kind === "waiting" ? formatWaitingDetail(snapshot) : formatActiveDetail(snapshot);
-    return boundStatusLine(`${boundedName} running ${snapshot.elapsedText}, recovered; ${detail}.`);
+      snapshot.kind === "waiting"
+        ? formatWaitingDetail(snapshot)
+        : formatActiveDetail(snapshot);
+    return boundStatusLine(
+      `${boundedName} running ${snapshot.elapsedText}, recovered; ${detail}.`,
+    );
   }
 
   return formatStatusLine(boundedName, snapshot);
 }
 
-export function capStatusLines(lines: string[], lineLimit: number): CappedStatusLines {
+export function capStatusLines(
+  lines: string[],
+  lineLimit: number,
+): CappedStatusLines {
   const visibleLines = lines.slice(0, lineLimit);
   return {
     visibleLines,
@@ -528,7 +595,10 @@ export function capStatusLines(lines: string[], lineLimit: number): CappedStatus
   };
 }
 
-export function formatStatusAggregate(lines: string[], lineLimit: number): string {
+export function formatStatusAggregate(
+  lines: string[],
+  lineLimit: number,
+): string {
   const { visibleLines, overflow } = capStatusLines(lines, lineLimit);
   const bulletLines = visibleLines.map((line) => `• ${line}`);
   if (overflow > 0) bulletLines.push(`• +${overflow} more running.`);

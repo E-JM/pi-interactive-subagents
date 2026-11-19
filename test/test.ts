@@ -1,42 +1,59 @@
-import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { after, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@mariozechner/pi-tui";
-import * as subagentsModule from "../pi-extension/subagents/index.ts";
-
 import {
-  getLeafId,
-  getNewEntries,
-  findLastAssistantMessage,
-  appendBranchSummary,
-  copySessionFile,
-  mergeNewEntries,
-  seedSubagentSessionFile,
-} from "../pi-extension/subagents/session.ts";
-
+  createSubagentActivityRecorder,
+  getSubagentActivityFile,
+  readSubagentActivityFile,
+} from "../pi-extension/subagents/activity.ts";
 import {
-  shellEscape,
+  __pollForExitTest__,
+  canSplitZellijPane,
+  getSubagentLayoutMode,
+  gridDimsForCount,
   isCmuxAvailable,
-  isWezTermAvailable,
   isHerdrAvailable,
-  parseHerdrPaneId,
+  isWezTermAvailable,
   parseCmuxFocusedSnapshot,
   parseCmuxFocusedSnapshotFromJson,
   parseCmuxJson,
   parseCmuxPaneRefForSurface,
   parseCmuxPaneRefForSurfaceFromJson,
-  canSplitZellijPane,
+  parseHerdrLayout,
+  parseHerdrPaneId,
+  parseTmuxPaneGeometry,
+  planGridTargets,
+  planHerdrGridRebalance,
+  planHerdrRebalance,
+  planTmuxGridRebalance,
+  planTmuxRebalance,
   predictZellijSplitDirection,
+  selectTiledGridAnchor,
   selectZellijPlacement,
   selectZellijStackPlacement,
-  parseHerdrLayout,
-  parseTmuxPaneGeometry,
-  planHerdrRebalance,
-  planTmuxRebalance,
+  setSubagentLayoutMode,
+  shellEscape,
 } from "../pi-extension/subagents/cmux.ts";
+import * as subagentsModule from "../pi-extension/subagents/index.ts";
+import {
+  appendBranchSummary,
+  copySessionFile,
+  findLastAssistantMessage,
+  getLeafId,
+  getNewEntries,
+  mergeNewEntries,
+  seedSubagentSessionFile,
+} from "../pi-extension/subagents/session.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -46,21 +63,14 @@ import {
   formatStatusAggregate,
   formatStatusLine,
   formatTransitionLine,
-  observeStatus,
   loadStatusConfig,
+  observeStatus,
   parseStatusConfig,
 } from "../pi-extension/subagents/status.ts";
 import {
-  createSubagentActivityRecorder,
-  getSubagentActivityFile,
-  readSubagentActivityFile,
-} from "../pi-extension/subagents/activity.ts";
-import {
-  shouldMarkUserTookOver,
-  shouldAutoExitOnAgentEnd,
   findLatestAssistantError,
+  shouldAutoExitOnAgentEnd,
 } from "../pi-extension/subagents/subagent-done.ts";
-import { __pollForExitTest__ } from "../pi-extension/subagents/cmux.ts";
 
 // --- Helpers ---
 
@@ -70,7 +80,7 @@ function createTestDir(): string {
 
 function createSessionFile(dir: string, entries: object[]): string {
   const file = join(dir, "test-session.jsonl");
-  const content = entries.map((e) => JSON.stringify(e)).join("\n") + "\n";
+  const content = `${entries.map((e) => JSON.stringify(e)).join("\n")}\n`;
   writeFileSync(file, content);
   return file;
 }
@@ -146,7 +156,10 @@ function writeAgentFile(
   body = "You are a test agent.",
 ) {
   mkdirSync(agentsDir, { recursive: true });
-  writeFileSync(join(agentsDir, `${name}.md`), `---\n${frontmatter}\n---\n\n${body}\n`);
+  writeFileSync(
+    join(agentsDir, `${name}.md`),
+    `---\n${frontmatter}\n---\n\n${body}\n`,
+  );
 }
 
 async function withIsolatedAgentEnv(
@@ -237,7 +250,12 @@ describe("session.ts", () => {
 
   describe("getLeafId", () => {
     it("returns last entry id", () => {
-      const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
+      const file = createSessionFile(dir, [
+        SESSION_HEADER,
+        MODEL_CHANGE,
+        USER_MSG,
+        ASSISTANT_MSG,
+      ]);
       assert.equal(getLeafId(file), "asst-001");
     });
 
@@ -250,7 +268,12 @@ describe("session.ts", () => {
 
   describe("getNewEntries", () => {
     it("returns entries after a given line", () => {
-      const file = createSessionFile(dir, [SESSION_HEADER, MODEL_CHANGE, USER_MSG, ASSISTANT_MSG]);
+      const file = createSessionFile(dir, [
+        SESSION_HEADER,
+        MODEL_CHANGE,
+        USER_MSG,
+        ASSISTANT_MSG,
+      ]);
       const entries = getNewEntries(file, 2);
       assert.equal(entries.length, 2);
       assert.equal(entries[0].id, "user-001");
@@ -351,7 +374,10 @@ describe("session.ts", () => {
           errorMessage: "stream interrupted",
         },
       };
-      assert.equal(findLastAssistantMessage([msg] as any[]), "Here is partial output.");
+      assert.equal(
+        findLastAssistantMessage([msg] as any[]),
+        "Here is partial output.",
+      );
     });
 
     it("does not invent a summary for a stop=error message with no errorMessage", () => {
@@ -369,8 +395,17 @@ describe("session.ts", () => {
 
   describe("appendBranchSummary", () => {
     it("appends valid branch_summary entry", () => {
-      const file = createSessionFile(dir, [SESSION_HEADER, USER_MSG, ASSISTANT_MSG]);
-      const id = appendBranchSummary(file, "user-001", "asst-001", "The plan was created.");
+      const file = createSessionFile(dir, [
+        SESSION_HEADER,
+        USER_MSG,
+        ASSISTANT_MSG,
+      ]);
+      const id = appendBranchSummary(
+        file,
+        "user-001",
+        "asst-001",
+        "The plan was created.",
+      );
 
       assert.ok(id, "should return an id");
       assert.equal(typeof id, "string");
@@ -463,7 +498,10 @@ describe("session.ts", () => {
       assert.equal(entries[0].cwd, "/tmp/fork-child-cwd");
       assert.equal(entries[1].type, "model_change");
       assert.equal(
-        entries.some((entry) => entry.type === "session" && entry.parentSession !== parentFile),
+        entries.some(
+          (entry) =>
+            entry.type === "session" && entry.parentSession !== parentFile,
+        ),
         false,
       );
       assert.equal(
@@ -480,11 +518,14 @@ describe("session.ts", () => {
       const targetFile = join(dir, "merge-target.jsonl");
       writeFileSync(
         sourceFile,
-        [SESSION_HEADER, USER_MSG, ASSISTANT_MSG].map((e) => JSON.stringify(e)).join("\n") + "\n",
+        `${[SESSION_HEADER, USER_MSG, ASSISTANT_MSG]
+          .map((e) => JSON.stringify(e))
+          .join("\n")}\n`,
       );
       writeFileSync(
         targetFile,
-        [SESSION_HEADER, USER_MSG].map((e) => JSON.stringify(e)).join("\n") + "\n",
+        [SESSION_HEADER, USER_MSG].map((e) => JSON.stringify(e)).join("\n") +
+          "\n",
       );
 
       // Merge entries after line 2 (the shared base)
@@ -510,7 +551,9 @@ describe("status.ts", () => {
   });
 
   it("loads a valid config file", () => {
-    const examplePath = fileURLToPath(new URL("../config.json.example", import.meta.url));
+    const examplePath = fileURLToPath(
+      new URL("../config.json.example", import.meta.url),
+    );
     const config = loadStatusConfig(examplePath);
 
     assert.deepEqual(config, {
@@ -522,7 +565,10 @@ describe("status.ts", () => {
   it("loads the shared example when local config is absent", () => {
     withTempDir((dir) => {
       const examplePath = join(dir, "config.json.example");
-      writeFileSync(examplePath, JSON.stringify({ status: { enabled: true } }, null, 2) + "\n");
+      writeFileSync(
+        examplePath,
+        `${JSON.stringify({ status: { enabled: true } }, null, 2)}\n`,
+      );
 
       const config = loadStatusConfig(join(dir, "config.json"), examplePath);
 
@@ -539,7 +585,10 @@ describe("status.ts", () => {
       /status\.enabled must be a boolean/,
     );
     assert.throws(
-      () => parseStatusConfig({ status: { enabled: true, defaultCadenceSeconds: 60 } }),
+      () =>
+        parseStatusConfig({
+          status: { enabled: true, defaultCadenceSeconds: 60 },
+        }),
       /status has unsupported key\(s\): defaultCadenceSeconds/,
     );
   });
@@ -547,7 +596,11 @@ describe("status.ts", () => {
   it("reports when neither local nor shared config exists", () => {
     withTempDir((dir) => {
       assert.throws(
-        () => loadStatusConfig(join(dir, "config.json"), join(dir, "config.json.example")),
+        () =>
+          loadStatusConfig(
+            join(dir, "config.json"),
+            join(dir, "config.json.example"),
+          ),
         /Missing subagent status config\. Expected .*config\.json.*or.*config\.json\.example/,
       );
     });
@@ -570,7 +623,10 @@ describe("status.ts", () => {
       const configPath = join(dir, "config.json");
       const examplePath = join(dir, "config.json.example");
       writeFileSync(configPath, "{\n");
-      writeFileSync(examplePath, JSON.stringify({ status: { enabled: true } }, null, 2) + "\n");
+      writeFileSync(
+        examplePath,
+        `${JSON.stringify({ status: { enabled: true } }, null, 2)}\n`,
+      );
 
       assert.throws(
         () => loadStatusConfig(configPath, examplePath),
@@ -886,7 +942,10 @@ describe("status.ts", () => {
       },
       299_000,
     );
-    const line = formatStatusLine(longName, classifyStatus(stalledState, 240_000));
+    const line = formatStatusLine(
+      longName,
+      classifyStatus(stalledState, 240_000),
+    );
     const recovered = formatTransitionLine(
       longName,
       classifyStatus(activeState, 300_000),
@@ -895,8 +954,14 @@ describe("status.ts", () => {
 
     assert.doesNotMatch(line, /\n/);
     assert.doesNotMatch(recovered, /\n/);
-    assert.ok(line.length <= 120, `expected bounded line length, got ${line.length}`);
-    assert.ok(recovered.length <= 120, `expected bounded line length, got ${recovered.length}`);
+    assert.ok(
+      line.length <= 120,
+      `expected bounded line length, got ${line.length}`,
+    );
+    assert.ok(
+      recovered.length <= 120,
+      `expected bounded line length, got ${recovered.length}`,
+    );
   });
 
   it("caps visible status lines and reports overflow consistently", () => {
@@ -925,7 +990,10 @@ describe("status.ts", () => {
       },
       419_000,
     );
-    const waitingLine = formatStatusLine("Worker", classifyStatus(waitingState, 300_000));
+    const waitingLine = formatStatusLine(
+      "Worker",
+      classifyStatus(waitingState, 300_000),
+    );
     const recoveredLine = formatTransitionLine(
       "Worker",
       classifyStatus(activeState, 420_000),
@@ -942,8 +1010,15 @@ describe("status.ts", () => {
     const aggregate = formatStatusAggregate(lines, 3);
 
     assert.equal(waitingLine, "Worker running 5m, waiting 2m.");
-    assert.equal(recoveredLine, "Worker running 7m, recovered; active (bash 1s).");
-    assert.deepEqual(capped.visibleLines, [waitingLine, recoveredLine, "Scout running 2m."]);
+    assert.equal(
+      recoveredLine,
+      "Worker running 7m, recovered; active (bash 1s).",
+    );
+    assert.deepEqual(capped.visibleLines, [
+      waitingLine,
+      recoveredLine,
+      "Scout running 2m.",
+    ]);
     assert.equal(capped.overflow, 2);
     assert.match(aggregate, /^Subagent status:/);
     assert.match(aggregate, /\+2 more running\./);
@@ -993,10 +1068,14 @@ describe("subagent discovery", () => {
         ].join("\n"),
       );
 
-      const loadedTrue = testApi.loadAgentDefaults("interactive-true-test-agent");
+      const loadedTrue = testApi.loadAgentDefaults(
+        "interactive-true-test-agent",
+      );
       assert.equal(loadedTrue?.interactive, true);
 
-      const loadedFalse = testApi.loadAgentDefaults("interactive-false-test-agent");
+      const loadedFalse = testApi.loadAgentDefaults(
+        "interactive-false-test-agent",
+      );
       assert.equal(loadedFalse?.interactive, false);
     });
   });
@@ -1006,9 +1085,10 @@ describe("subagent discovery", () => {
       writeAgentFile(
         projectAgentsDir,
         "interactive-unset-test-agent",
-        ["name: interactive-unset-test-agent", "model: anthropic/test-interactive-unset"].join(
-          "\n",
-        ),
+        [
+          "name: interactive-unset-test-agent",
+          "model: anthropic/test-interactive-unset",
+        ].join("\n"),
       );
 
       const loaded = testApi.loadAgentDefaults("interactive-unset-test-agent");
@@ -1019,17 +1099,29 @@ describe("subagent discovery", () => {
   it("resolveEffectiveInteractive defaults to the inverse of auto-exit", () => {
     // Autonomous agents (auto-exit: true) are NOT interactive — parent gets stall pings.
     assert.equal(
-      testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, { autoExit: true }),
+      testApi.resolveEffectiveInteractive(
+        { name: "A", task: "T" },
+        { autoExit: true },
+      ),
       false,
     );
     // Agents without auto-exit ARE interactive — parent does not receive status transition pings.
     assert.equal(
-      testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, { autoExit: false }),
+      testApi.resolveEffectiveInteractive(
+        { name: "A", task: "T" },
+        { autoExit: false },
+      ),
       true,
     );
-    assert.equal(testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, {}), true);
+    assert.equal(
+      testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, {}),
+      true,
+    );
     // Bare spawn with no agent defs (e.g. /iterate fork) is interactive by default.
-    assert.equal(testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, null), true);
+    assert.equal(
+      testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, null),
+      true,
+    );
   });
 
   it("resolveEffectiveInteractive honors explicit frontmatter over the auto-exit default", () => {
@@ -1043,7 +1135,10 @@ describe("subagent discovery", () => {
     );
     // Non-auto-exit agent that opts back into stall pings.
     assert.equal(
-      testApi.resolveEffectiveInteractive({ name: "A", task: "T" }, { interactive: false }),
+      testApi.resolveEffectiveInteractive(
+        { name: "A", task: "T" },
+        { interactive: false },
+      ),
       false,
     );
   });
@@ -1079,7 +1174,10 @@ describe("subagent discovery", () => {
     const planner = testApi.loadAgentDefaults("planner");
     assert.ok(planner, "expected bundled planner to be discoverable");
     assert.equal(
-      testApi.resolveEffectiveInteractive({ name: "planner", task: "" }, planner),
+      testApi.resolveEffectiveInteractive(
+        { name: "planner", task: "" },
+        planner,
+      ),
       true,
       "planner should resolve as interactive (no auto-exit)",
     );
@@ -1104,7 +1202,10 @@ describe("subagent discovery", () => {
   });
 
   it("resolves session mode with fork override precedence", () => {
-    assert.equal(testApi.resolveEffectiveSessionMode({ name: "A", task: "T" }, null), "standalone");
+    assert.equal(
+      testApi.resolveEffectiveSessionMode({ name: "A", task: "T" }, null),
+      "standalone",
+    );
     assert.equal(
       testApi.resolveEffectiveSessionMode(
         { name: "A", task: "T" },
@@ -1122,14 +1223,20 @@ describe("subagent discovery", () => {
   });
 
   it("resolves launch behavior for standalone, lineage-only, and fork modes", () => {
-    assert.deepEqual(testApi.resolveLaunchBehavior({ name: "A", task: "T" }, null), {
-      sessionMode: "standalone",
-      seededSessionMode: null,
-      inheritsConversationContext: false,
-      taskDelivery: "artifact",
-    });
     assert.deepEqual(
-      testApi.resolveLaunchBehavior({ name: "A", task: "T" }, { sessionMode: "lineage-only" }),
+      testApi.resolveLaunchBehavior({ name: "A", task: "T" }, null),
+      {
+        sessionMode: "standalone",
+        seededSessionMode: null,
+        inheritsConversationContext: false,
+        taskDelivery: "artifact",
+      },
+    );
+    assert.deepEqual(
+      testApi.resolveLaunchBehavior(
+        { name: "A", task: "T" },
+        { sessionMode: "lineage-only" },
+      ),
       {
         sessionMode: "lineage-only",
         seededSessionMode: "lineage-only",
@@ -1138,7 +1245,10 @@ describe("subagent discovery", () => {
       },
     );
     assert.deepEqual(
-      testApi.resolveLaunchBehavior({ name: "A", task: "T" }, { sessionMode: "fork" }),
+      testApi.resolveLaunchBehavior(
+        { name: "A", task: "T" },
+        { sessionMode: "fork" },
+      ),
       {
         sessionMode: "fork",
         seededSessionMode: "fork",
@@ -1220,13 +1330,19 @@ describe("subagent discovery", () => {
       const { api, registeredTools } = createMockExtensionApi();
       (subagentsModule as any).default(api);
 
-      const tool = registeredTools.find((tool) => tool.name === "subagents_list");
+      const tool = registeredTools.find(
+        (tool) => tool.name === "subagents_list",
+      );
       assert.ok(tool, "expected subagents_list to be registered");
 
       const result = await tool.execute();
       const agents = result.details?.agents ?? [];
 
-      assert.ok(agents.some((agent: any) => agent.name === "visible-discovery-test-agent"));
+      assert.ok(
+        agents.some(
+          (agent: any) => agent.name === "visible-discovery-test-agent",
+        ),
+      );
       assert.match(result.content[0].text, /visible-discovery-test-agent/);
     });
   });
@@ -1248,17 +1364,24 @@ describe("subagent discovery", () => {
       const { api, registeredTools } = createMockExtensionApi();
       (subagentsModule as any).default(api);
 
-      const tool = registeredTools.find((tool) => tool.name === "subagents_list");
+      const tool = registeredTools.find(
+        (tool) => tool.name === "subagents_list",
+      );
       assert.ok(tool, "expected subagents_list to be registered");
 
       const result = await tool.execute();
       const agents = result.details?.agents ?? [];
 
       assert.equal(
-        agents.some((agent: any) => agent.name === "hidden-discovery-test-agent"),
+        agents.some(
+          (agent: any) => agent.name === "hidden-discovery-test-agent",
+        ),
         false,
       );
-      assert.doesNotMatch(result.content[0].text, /hidden-discovery-test-agent/);
+      assert.doesNotMatch(
+        result.content[0].text,
+        /hidden-discovery-test-agent/,
+      );
 
       const loaded = testApi.loadAgentDefaults("hidden-discovery-test-agent");
       assert.ok(loaded, "expected hidden agent to remain directly loadable");
@@ -1269,63 +1392,67 @@ describe("subagent discovery", () => {
   });
 
   it("lets a hidden project agent shadow a visible global agent", async () => {
-    await withIsolatedAgentEnv(async ({ projectAgentsDir, globalAgentsDir }) => {
-      writeAgentFile(
-        globalAgentsDir,
-        "shadowed-discovery-test-agent",
-        [
-          "name: shadowed-discovery-test-agent",
-          "description: Global visible agent",
-          "model: anthropic/test-global",
-        ].join("\n"),
-        "You are the global visible agent.",
-      );
-      writeAgentFile(
-        projectAgentsDir,
-        "shadowed-discovery-test-agent",
-        [
-          "name: shadowed-discovery-test-agent",
-          "description: Project hidden agent",
-          "model: anthropic/test-project",
-          "disable-model-invocation: true",
-        ].join("\n"),
-        "You are the project hidden agent.",
-      );
+    await withIsolatedAgentEnv(
+      async ({ projectAgentsDir, globalAgentsDir }) => {
+        writeAgentFile(
+          globalAgentsDir,
+          "shadowed-discovery-test-agent",
+          [
+            "name: shadowed-discovery-test-agent",
+            "description: Global visible agent",
+            "model: anthropic/test-global",
+          ].join("\n"),
+          "You are the global visible agent.",
+        );
+        writeAgentFile(
+          projectAgentsDir,
+          "shadowed-discovery-test-agent",
+          [
+            "name: shadowed-discovery-test-agent",
+            "description: Project hidden agent",
+            "model: anthropic/test-project",
+            "disable-model-invocation: true",
+          ].join("\n"),
+          "You are the project hidden agent.",
+        );
 
-      const { api, registeredTools } = createMockExtensionApi();
-      (subagentsModule as any).default(api);
+        const { api, registeredTools } = createMockExtensionApi();
+        (subagentsModule as any).default(api);
 
-      const tool = registeredTools.find((tool) => tool.name === "subagents_list");
-      assert.ok(tool, "expected subagents_list to be registered");
+        const tool = registeredTools.find(
+          (tool) => tool.name === "subagents_list",
+        );
+        assert.ok(tool, "expected subagents_list to be registered");
 
-      const result = await tool.execute();
-      const agents = result.details?.agents ?? [];
+        const result = await tool.execute();
+        const agents = result.details?.agents ?? [];
 
-      assert.equal(
-        agents.some((agent: any) => agent.name === "shadowed-discovery-test-agent"),
-        false,
-      );
-      assert.doesNotMatch(result.content[0].text, /shadowed-discovery-test-agent/);
+        assert.equal(
+          agents.some(
+            (agent: any) => agent.name === "shadowed-discovery-test-agent",
+          ),
+          false,
+        );
+        assert.doesNotMatch(
+          result.content[0].text,
+          /shadowed-discovery-test-agent/,
+        );
 
-      const loaded = testApi.loadAgentDefaults("shadowed-discovery-test-agent");
-      assert.ok(loaded, "expected project override to remain directly loadable");
-      assert.equal(loaded.model, "anthropic/test-project");
-      assert.equal(loaded.body, "You are the project hidden agent.");
-      assert.equal(loaded.disableModelInvocation, true);
-    });
+        const loaded = testApi.loadAgentDefaults(
+          "shadowed-discovery-test-agent",
+        );
+        assert.ok(
+          loaded,
+          "expected project override to remain directly loadable",
+        );
+        assert.equal(loaded.model, "anthropic/test-project");
+        assert.equal(loaded.body, "You are the project hidden agent.");
+        assert.equal(loaded.disableModelInvocation, true);
+      },
+    );
   });
 });
 describe("subagent-done.ts", () => {
-  describe("shouldMarkUserTookOver", () => {
-    it("ignores the initial injected task before the first agent run", () => {
-      assert.equal(shouldMarkUserTookOver(false), false);
-    });
-
-    it("treats later input as manual takeover", () => {
-      assert.equal(shouldMarkUserTookOver(true), true);
-    });
-  });
-
   describe("shouldAutoExitOnAgentEnd", () => {
     it("auto-exits after normal completion when there was no takeover", () => {
       const messages = [{ role: "assistant", stopReason: "stop" }];
@@ -1346,7 +1473,13 @@ describe("subagent-done.ts", () => {
       // Auto-exit subagents must shut down on retry-exhaustion errors so the
       // parent is woken. The error sidecar (written separately) carries the
       // failure detail; staying open would just strand the worker.
-      const messages = [{ role: "assistant", stopReason: "error", errorMessage: "529 overloaded" }];
+      const messages = [
+        {
+          role: "assistant",
+          stopReason: "error",
+          errorMessage: "529 overloaded",
+        },
+      ];
       assert.equal(shouldAutoExitOnAgentEnd(false, messages), true);
     });
   });
@@ -1354,9 +1487,17 @@ describe("subagent-done.ts", () => {
   describe("findLatestAssistantError", () => {
     it("returns the error info from a stopReason=error message", () => {
       const messages = [
-        { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "ok" }] },
+        {
+          role: "assistant",
+          stopReason: "stop",
+          content: [{ type: "text", text: "ok" }],
+        },
         { role: "toolResult", content: [] },
-        { role: "assistant", stopReason: "error", errorMessage: "Anthropic 529 Overloaded" },
+        {
+          role: "assistant",
+          stopReason: "error",
+          errorMessage: "Anthropic 529 Overloaded",
+        },
       ];
       assert.deepEqual(findLatestAssistantError(messages), {
         errorMessage: "Anthropic 529 Overloaded",
@@ -1368,7 +1509,11 @@ describe("subagent-done.ts", () => {
       const messages = [
         { role: "assistant", stopReason: "error", errorMessage: "old failure" },
         { role: "user", content: [] },
-        { role: "assistant", stopReason: "stop", content: [{ type: "text", text: "done" }] },
+        {
+          role: "assistant",
+          stopReason: "stop",
+          content: [{ type: "text", text: "done" }],
+        },
       ];
       assert.equal(findLatestAssistantError(messages), null);
     });
@@ -1382,8 +1527,8 @@ describe("subagent-done.ts", () => {
       const messages = [{ role: "assistant", stopReason: "error" }];
       const info = findLatestAssistantError(messages);
       assert.ok(info);
-      assert.equal(info!.stopReason, "error");
-      assert.match(info!.errorMessage, /stopReason=error/);
+      assert.equal(info?.stopReason, "error");
+      assert.match(info?.errorMessage, /stopReason=error/);
     });
 
     it("returns null when messages is undefined or empty", () => {
@@ -1397,11 +1542,18 @@ describe("cmux.ts interpretExitSidecar", () => {
   const { interpretExitSidecar } = __pollForExitTest__;
 
   it("decodes ping payloads", () => {
-    assert.deepEqual(interpretExitSidecar({ type: "ping", name: "Worker", message: "need help" }), {
-      reason: "ping",
-      exitCode: 0,
-      ping: { name: "Worker", message: "need help" },
-    });
+    assert.deepEqual(
+      interpretExitSidecar({
+        type: "ping",
+        name: "Worker",
+        message: "need help",
+      }),
+      {
+        reason: "ping",
+        exitCode: 0,
+        ping: { name: "Worker", message: "need help" },
+      },
+    );
   });
 
   it("decodes done payloads", () => {
@@ -1435,16 +1587,22 @@ describe("cmux.ts interpretExitSidecar", () => {
 
   it("treats unknown payload shapes as done", () => {
     assert.deepEqual(interpretExitSidecar({}), { reason: "done", exitCode: 0 });
-    assert.deepEqual(interpretExitSidecar(null), { reason: "done", exitCode: 0 });
+    assert.deepEqual(interpretExitSidecar(null), {
+      reason: "done",
+      exitCode: 0,
+    });
   });
 });
 describe("commands", () => {
   it("/iterate always emits a full-context fork tool call", () => {
-    const { api, registeredCommands, sentUserMessages } = createMockExtensionApi();
+    const { api, registeredCommands, sentUserMessages } =
+      createMockExtensionApi();
 
     (subagentsModule as any).default(api);
 
-    const iterate = registeredCommands.find((command) => command.name === "iterate");
+    const iterate = registeredCommands.find(
+      (command) => command.name === "iterate",
+    );
     assert.ok(iterate, "expected /iterate to be registered");
 
     iterate.handler("Fix the bug", {});
@@ -1482,7 +1640,9 @@ describe("tool registration", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
-    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+    const subagentTool = registeredTools.find(
+      (tool) => tool.name === "subagent",
+    );
     assert.ok(subagentTool, "expected subagent tool to be registered");
 
     const theme = {
@@ -1503,7 +1663,9 @@ describe("tool registration", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
-    const resumeTool = registeredTools.find((tool) => tool.name === "subagent_resume");
+    const resumeTool = registeredTools.find(
+      (tool) => tool.name === "subagent_resume",
+    );
     assert.ok(resumeTool, "expected subagent_resume tool to be registered");
 
     const autoExitSchema = resumeTool.parameters.properties.autoExit;
@@ -1597,7 +1759,10 @@ describe("subagent activity snapshots", () => {
 
       for (const [index, overrides] of cases.entries()) {
         const activityFile = getSubagentActivityFile(dir, `child-${index}`);
-        const activity = validActivity({ runningChildId: `child-${index}`, ...overrides });
+        const activity = validActivity({
+          runningChildId: `child-${index}`,
+          ...overrides,
+        });
         writeFileSync(activityFile, `${JSON.stringify(activity)}\n`);
 
         const read = readSubagentActivityFile(activityFile, `child-${index}`);
@@ -1718,15 +1883,30 @@ describe("subagent interruption", () => {
     try {
       runningMap.set(
         "a1",
-        makeRunning({ id: "a1", name: "Worker", surface: "a1", sessionFile: "a1.jsonl" }),
+        makeRunning({
+          id: "a1",
+          name: "Worker",
+          surface: "a1",
+          sessionFile: "a1.jsonl",
+        }),
       );
       runningMap.set(
         "b2",
-        makeRunning({ id: "b2", name: "Worker", surface: "b2", sessionFile: "b2.jsonl" }),
+        makeRunning({
+          id: "b2",
+          name: "Worker",
+          surface: "b2",
+          sessionFile: "b2.jsonl",
+        }),
       );
       runningMap.set(
         "c3",
-        makeRunning({ id: "c3", name: "Scout", surface: "c3", sessionFile: "c3.jsonl" }),
+        makeRunning({
+          id: "c3",
+          name: "Scout",
+          surface: "c3",
+          sessionFile: "c3.jsonl",
+        }),
       );
 
       const byId = testApi.resolveInterruptTarget({ id: "c3", name: "Worker" });
@@ -1789,7 +1969,10 @@ describe("subagent interruption", () => {
       );
 
       assert.match(result.content[0].text, /Failed to send Escape/);
-      assert.equal(classifyStatus(runningMap.get("a1").statusState, 20_000).kind, "active");
+      assert.equal(
+        classifyStatus(runningMap.get("a1").statusState, 20_000).kind,
+        "active",
+      );
     } finally {
       runningMap.clear();
     }
@@ -1807,9 +1990,12 @@ describe("subagent interruption", () => {
       },
     });
 
-    const result = testApi.requestSubagentInterrupt(running, (surface: string) => {
-      sentSurface = surface;
-    });
+    const result = testApi.requestSubagentInterrupt(
+      running,
+      (surface: string) => {
+        sentSurface = surface;
+      },
+    );
 
     assert.deepEqual(result, { ok: true });
     assert.equal(sentSurface, "pane-1");
@@ -1854,9 +2040,12 @@ describe("subagent interruption", () => {
         );
 
         withMockedNow(20_000, () =>
-          testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
-            sentSurface = surface;
-          }),
+          testApi.handleSubagentInterrupt(
+            { name: "Worker" },
+            (surface: string) => {
+              sentSurface = surface;
+            },
+          ),
         );
 
         assert.equal(sentSurface, "pane-1");
@@ -1898,14 +2087,24 @@ describe("subagent interruption", () => {
       runningMap.set("a1", makeRunning({ statusState: activeState }));
 
       const result = withMockedNow(20_000, () =>
-        testApi.handleSubagentInterrupt({ name: "Worker" }, (surface: string) => {
-          sentSurface = surface;
-        }),
+        testApi.handleSubagentInterrupt(
+          { name: "Worker" },
+          (surface: string) => {
+            sentSurface = surface;
+          },
+        ),
       );
 
       assert.equal(sentSurface, "pane-1");
-      assert.equal(result.content[0].text, 'Interrupt requested for subagent "Worker".');
-      assert.deepEqual(result.details, { id: "a1", name: "Worker", status: "interrupt_requested" });
+      assert.equal(
+        result.content[0].text,
+        'Interrupt requested for subagent "Worker".',
+      );
+      assert.deepEqual(result.details, {
+        id: "a1",
+        name: "Worker",
+        status: "interrupt_requested",
+      });
       const snapshot = classifyStatus(runningMap.get("a1").statusState, 20_000);
       assert.equal(snapshot.kind, "waiting");
       assert.equal(snapshot.activityLabel, "interrupted");
@@ -1952,7 +2151,10 @@ describe("subagent interruption", () => {
       });
 
       assert.equal(delivered, false);
-      assert.match(result.content[0].text, /currently supported only for Pi-backed subagents/i);
+      assert.match(
+        result.content[0].text,
+        /currently supported only for Pi-backed subagents/i,
+      );
       assert.deepEqual(result.details, {
         error: "claude interrupt unsupported",
         id: "a1",
@@ -2000,7 +2202,10 @@ describe("subagent interruption", () => {
 
     assert.match(presentation, /Sub-agent "Worker" failed/);
     assert.match(presentation, /provider\/agent error — auto-retry exhausted/);
-    assert.match(presentation, /Error: Anthropic 529 Overloaded after 3 retries/);
+    assert.match(
+      presentation,
+      /Error: Anthropic 529 Overloaded after 3 retries/,
+    );
     assert.match(presentation, /subagent_resume/);
     assert.match(presentation, /Resume: pi --session/);
     assert.doesNotMatch(presentation, /ignored when errorMessage is present/);
@@ -2029,7 +2234,10 @@ describe("subagent status renderer", () => {
     const rendererEntry = registeredMessageRenderers.find(
       (entry) => entry.name === "subagent_status",
     );
-    assert.ok(rendererEntry, "expected subagent_status renderer to be registered");
+    assert.ok(
+      rendererEntry,
+      "expected subagent_status renderer to be registered",
+    );
 
     const visibleLines = [
       "Worker running 5m, active (bash 2m).",
@@ -2053,7 +2261,10 @@ describe("subagent status renderer", () => {
 
     assert.match(output, /Subagent status/);
     for (const line of visibleLines) {
-      assert.match(output, new RegExp(line.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+      assert.match(
+        output,
+        new RegExp(line.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+      );
     }
     assert.match(output, /\+2 more running\./);
   });
@@ -2065,13 +2276,19 @@ describe("subagent status renderer", () => {
     const rendererEntry = registeredMessageRenderers.find(
       (entry) => entry.name === "subagent_status",
     );
-    assert.ok(rendererEntry, "expected subagent_status renderer to be registered");
+    assert.ok(
+      rendererEntry,
+      "expected subagent_status renderer to be registered",
+    );
 
     const rendered = rendererEntry.renderer(
       {
         customType: "subagent_status",
         content: "Subagent status:\n• Worker running 5m, active (bash 2m).",
-        details: { lines: ["Worker running 5m, active (bash 2m)."], overflow: 0 },
+        details: {
+          lines: ["Worker running 5m, active (bash 2m)."],
+          overflow: 0,
+        },
       },
       { expanded: true },
       createTheme(),
@@ -2137,7 +2354,10 @@ describe("subagents widget rendering", () => {
             surface: "s1",
             startTime: 1_000_000 - 13_000,
             sessionFile: "sess1",
-            statusState: createStatusState({ source: "pi", startTimeMs: 1_000_000 - 13_000 }),
+            statusState: createStatusState({
+              source: "pi",
+              startTimeMs: 1_000_000 - 13_000,
+            }),
           },
           {
             id: "a2",
@@ -2146,7 +2366,10 @@ describe("subagents widget rendering", () => {
             surface: "s2",
             startTime: 1_000_000 - 21_000,
             sessionFile: "sess2",
-            statusState: createStatusState({ source: "pi", startTimeMs: 1_000_000 - 21_000 }),
+            statusState: createStatusState({
+              source: "pi",
+              startTimeMs: 1_000_000 - 21_000,
+            }),
           },
           {
             id: "a3",
@@ -2155,7 +2378,10 @@ describe("subagents widget rendering", () => {
             surface: "s3",
             startTime: 1_000_000 - 27_000,
             sessionFile: "sess3",
-            statusState: createStatusState({ source: "pi", startTimeMs: 1_000_000 - 27_000 }),
+            statusState: createStatusState({
+              source: "pi",
+              startTimeMs: 1_000_000 - 27_000,
+            }),
           },
         ],
         16,
@@ -2196,7 +2422,10 @@ describe("subagents widget rendering", () => {
             surface: "s1",
             startTime,
             sessionFile: "sess1",
-            statusState: createStatusState({ source: "pi", startTimeMs: startTime }),
+            statusState: createStatusState({
+              source: "pi",
+              startTimeMs: startTime,
+            }),
           },
         ],
         width,
@@ -2239,14 +2468,18 @@ describe("cmux.ts", () => {
   describe("parseCmuxFocusedSnapshot", () => {
     it("parses focused surface and pane refs", () => {
       assert.deepEqual(
-        parseCmuxFocusedSnapshot({ focused: { surface_ref: "surface:3", pane_ref: "pane:2" } }),
+        parseCmuxFocusedSnapshot({
+          focused: { surface_ref: "surface:3", pane_ref: "pane:2" },
+        }),
         { surfaceRef: "surface:3", paneRef: "pane:2" },
       );
     });
 
     it("does not fall back to caller refs", () => {
       assert.equal(
-        parseCmuxFocusedSnapshot({ caller: { surface_ref: "surface:1", pane_ref: "pane:1" } }),
+        parseCmuxFocusedSnapshot({
+          caller: { surface_ref: "surface:1", pane_ref: "pane:1" },
+        }),
         null,
       );
     });
@@ -2300,7 +2533,10 @@ describe("cmux.ts", () => {
   describe("parseCmuxPaneRefForSurface", () => {
     it("parses top-level pane refs for a surface", () => {
       assert.equal(
-        parseCmuxPaneRefForSurface({ surface_ref: "surface:7", pane_ref: "pane:4" }, "surface:7"),
+        parseCmuxPaneRefForSurface(
+          { surface_ref: "surface:7", pane_ref: "pane:4" },
+          "surface:7",
+        ),
         "pane:4",
       );
     });
@@ -2317,7 +2553,10 @@ describe("cmux.ts", () => {
 
     it("returns null when the surface does not match", () => {
       assert.equal(
-        parseCmuxPaneRefForSurface({ surface_ref: "surface:8", pane_ref: "pane:4" }, "surface:7"),
+        parseCmuxPaneRefForSurface(
+          { surface_ref: "surface:8", pane_ref: "pane:4" },
+          "surface:7",
+        ),
         null,
       );
     });
@@ -2325,7 +2564,10 @@ describe("cmux.ts", () => {
 
   describe("parseCmuxPaneRefForSurfaceFromJson", () => {
     it("returns null for malformed JSON text", () => {
-      assert.equal(parseCmuxPaneRefForSurfaceFromJson("not json", "surface:7"), null);
+      assert.equal(
+        parseCmuxPaneRefForSurfaceFromJson("not json", "surface:7"),
+        null,
+      );
     });
 
     it("parses caller refs from cmux identify --surface JSON text", () => {
@@ -2353,21 +2595,60 @@ describe("cmux.ts", () => {
     });
 
     it("matches Zellij direction and minimum split rules", () => {
-      assert.equal(predictZellijSplitDirection(pane({ pane_rows: 5, pane_columns: 11 })), "right");
-      assert.equal(predictZellijSplitDirection(pane({ pane_rows: 11, pane_columns: 5 })), "down");
-      assert.equal(predictZellijSplitDirection(pane({ pane_rows: 5, pane_columns: 10 })), null);
-      assert.equal(predictZellijSplitDirection(pane({ pane_rows: 4, pane_columns: 80 })), null);
+      assert.equal(
+        predictZellijSplitDirection(pane({ pane_rows: 5, pane_columns: 11 })),
+        "right",
+      );
+      assert.equal(
+        predictZellijSplitDirection(pane({ pane_rows: 11, pane_columns: 5 })),
+        "down",
+      );
+      assert.equal(
+        predictZellijSplitDirection(pane({ pane_rows: 5, pane_columns: 10 })),
+        null,
+      );
+      assert.equal(
+        predictZellijSplitDirection(pane({ pane_rows: 4, pane_columns: 80 })),
+        null,
+      );
 
-      assert.equal(canSplitZellijPane(pane({ pane_rows: 5, pane_columns: 11 })), true);
-      assert.equal(canSplitZellijPane(pane({ pane_rows: 11, pane_columns: 5 })), true);
-      assert.equal(canSplitZellijPane(pane({ pane_rows: 5, pane_columns: 10 })), false);
-      assert.equal(canSplitZellijPane(pane({ pane_rows: 4, pane_columns: 80 })), false);
+      assert.equal(
+        canSplitZellijPane(pane({ pane_rows: 5, pane_columns: 11 })),
+        true,
+      );
+      assert.equal(
+        canSplitZellijPane(pane({ pane_rows: 11, pane_columns: 5 })),
+        true,
+      );
+      assert.equal(
+        canSplitZellijPane(pane({ pane_rows: 5, pane_columns: 10 })),
+        false,
+      );
+      assert.equal(
+        canSplitZellijPane(pane({ pane_rows: 4, pane_columns: 80 })),
+        false,
+      );
 
-      assert.equal(canSplitZellijPane(pane({ pane_rows: 30, pane_columns: 100 }), 80, 20), false);
-      assert.equal(canSplitZellijPane(pane({ pane_rows: 45, pane_columns: 100 }), 80, 20), true);
-      assert.equal(canSplitZellijPane(pane({ pane_rows: 30, pane_columns: 170 }), 80, 20), true);
-      assert.equal(canSplitZellijPane(pane({ pane_rows: 31, pane_columns: 47 }), 50, 10), false);
-      assert.equal(canSplitZellijPane(pane({ pane_rows: 31, pane_columns: 77 }), 50, 10), true);
+      assert.equal(
+        canSplitZellijPane(pane({ pane_rows: 30, pane_columns: 100 }), 80, 20),
+        false,
+      );
+      assert.equal(
+        canSplitZellijPane(pane({ pane_rows: 45, pane_columns: 100 }), 80, 20),
+        true,
+      );
+      assert.equal(
+        canSplitZellijPane(pane({ pane_rows: 30, pane_columns: 170 }), 80, 20),
+        true,
+      );
+      assert.equal(
+        canSplitZellijPane(pane({ pane_rows: 31, pane_columns: 47 }), 50, 10),
+        false,
+      );
+      assert.equal(
+        canSplitZellijPane(pane({ pane_rows: 31, pane_columns: 77 }), 50, 10),
+        true,
+      );
     });
 
     it("uses tab-scoped split only when all Zellij split candidates are safe", () => {
@@ -2475,10 +2756,34 @@ describe("cmux.ts", () => {
       const plan = selectZellijPlacement(
         [
           pane({ id: 10, tab_id: 1, pane_rows: 5, pane_columns: 10 }),
-          pane({ id: 11, tab_id: 1, pane_rows: 60, pane_columns: 200, is_floating: true }),
-          pane({ id: 12, tab_id: 1, pane_rows: 60, pane_columns: 200, is_plugin: true }),
-          pane({ id: 13, tab_id: 1, pane_rows: 60, pane_columns: 200, exited: true }),
-          pane({ id: 14, tab_id: 1, pane_rows: 60, pane_columns: 200, is_selectable: false }),
+          pane({
+            id: 11,
+            tab_id: 1,
+            pane_rows: 60,
+            pane_columns: 200,
+            is_floating: true,
+          }),
+          pane({
+            id: 12,
+            tab_id: 1,
+            pane_rows: 60,
+            pane_columns: 200,
+            is_plugin: true,
+          }),
+          pane({
+            id: 13,
+            tab_id: 1,
+            pane_rows: 60,
+            pane_columns: 200,
+            exited: true,
+          }),
+          pane({
+            id: 14,
+            tab_id: 1,
+            pane_rows: 60,
+            pane_columns: 200,
+            is_selectable: false,
+          }),
           pane({ id: 15, tab_id: 2, pane_rows: 60, pane_columns: 200 }),
         ],
         10,
@@ -2518,7 +2823,10 @@ describe("cmux.ts", () => {
     it("extracts pane ids from pane split output", () => {
       const output = JSON.stringify({
         id: "cli:pane:split",
-        result: { pane: { pane_id: "w1:pB", tab_id: "w1:t1" }, type: "pane_info" },
+        result: {
+          pane: { pane_id: "w1:pB", tab_id: "w1:t1" },
+          type: "pane_info",
+        },
       });
       assert.equal(parseHerdrPaneId(output, "pane split"), "w1:pB");
     });
@@ -2536,12 +2844,22 @@ describe("cmux.ts", () => {
     });
 
     it("throws on malformed output", () => {
-      assert.throws(() => parseHerdrPaneId("not json", "pane split"), /Unexpected herdr/);
       assert.throws(
-        () => parseHerdrPaneId(JSON.stringify({ result: { pane: {} } }), "pane split"),
+        () => parseHerdrPaneId("not json", "pane split"),
         /Unexpected herdr/,
       );
-      assert.throws(() => parseHerdrPaneId("", "tab create"), /Unexpected herdr/);
+      assert.throws(
+        () =>
+          parseHerdrPaneId(
+            JSON.stringify({ result: { pane: {} } }),
+            "pane split",
+          ),
+        /Unexpected herdr/,
+      );
+      assert.throws(
+        () => parseHerdrPaneId("", "tab create"),
+        /Unexpected herdr/,
+      );
     });
   });
 
@@ -2561,7 +2879,13 @@ describe("cmux.ts", () => {
     /** Layout shaped like `herdr pane layout` output for a right-nested split row. */
     function makeLayout(
       totalWidth: number,
-      panes: Array<{ pane_id: string; x: number; width: number; height?: number; y?: number }>,
+      panes: Array<{
+        pane_id: string;
+        x: number;
+        width: number;
+        height?: number;
+        y?: number;
+      }>,
       splits: FixtureSplit[] = [],
     ) {
       return parseHerdrLayout(
@@ -2573,7 +2897,12 @@ describe("cmux.ts", () => {
               area: { x: 0, y: 0, width: totalWidth, height: 50 },
               panes: panes.map((p) => ({
                 pane_id: p.pane_id,
-                rect: { x: p.x, y: p.y ?? 0, width: p.width, height: p.height ?? 50 },
+                rect: {
+                  x: p.x,
+                  y: p.y ?? 0,
+                  width: p.width,
+                  height: p.height ?? 50,
+                },
               })),
               splits,
               tab_id: "w1:t1",
@@ -2636,8 +2965,11 @@ describe("cmux.ts", () => {
           }
         }
         assert.ok(best, `no split matched op ${JSON.stringify(op)}`);
-        const cur = ratios.get(best!.id)!;
-        ratios.set(best!.id, op.direction === "right" ? cur + op.amount : cur - op.amount);
+        const cur = ratios.get(best?.id)!;
+        ratios.set(
+          best?.id,
+          op.direction === "right" ? cur + op.amount : cur - op.amount,
+        );
       }
       const widths = new Map<string, number>();
       for (const leaf of layout.panes) {
@@ -2649,7 +2981,10 @@ describe("cmux.ts", () => {
               leaf.rect.y >= s.rect.y - 1.5 &&
               leaf.rect.y + leaf.rect.height <= s.rect.y + s.rect.height + 1.5,
           )
-          .sort((a, b) => b.rect.width * b.rect.height - a.rect.width * a.rect.height);
+          .sort(
+            (a, b) =>
+              b.rect.width * b.rect.height - a.rect.width * a.rect.height,
+          );
         let width = layout.area.width;
         for (const s of chain) {
           const ratio = ratios.get(s.id)!;
@@ -2862,7 +3197,10 @@ describe("cmux.ts", () => {
       assert.ok(ops.length > 0);
       const widths = simulateFinalWidths(layout!, ops);
       const parentTarget = 0.4 * 393;
-      assert.ok(Math.abs(widths.get(PARENT)! - parentTarget) < 1.5, `parent ${widths.get(PARENT)}`);
+      assert.ok(
+        Math.abs(widths.get(PARENT)! - parentTarget) < 1.5,
+        `parent ${widths.get(PARENT)}`,
+      );
       const cellTarget = (393 - parentTarget) / 4;
       for (const cell of [C1, C2, C3, "w1:p6"]) {
         assert.ok(
@@ -2945,20 +3283,28 @@ describe("cmux.ts", () => {
 
     function makePanes(
       windowWidth: number,
-      panes: Array<{ paneId: string; left: number; width: number; height?: number; top?: number }>,
+      panes: Array<{
+        paneId: string;
+        left: number;
+        width: number;
+        height?: number;
+        top?: number;
+      }>,
+      windowHeight = 50,
     ) {
       return panes.map((p) => ({
         paneId: p.paneId,
         left: p.left,
         top: p.top ?? 0,
         width: p.width,
-        height: p.height ?? 50,
+        height: p.height ?? windowHeight,
         windowWidth,
+        windowHeight,
       }));
     }
 
     it("parses tmux list-panes geometry output", () => {
-      const output = "%0|0|0|80|50|200\n%1|80|0|120|50|200\n";
+      const output = "%0|0|0|80|50|200|50\n%1|80|0|120|50|200|50\n";
       const panes = parseTmuxPaneGeometry(output);
       assert.equal(panes.length, 2);
       assert.deepEqual(panes[0], {
@@ -2968,11 +3314,14 @@ describe("cmux.ts", () => {
         width: 80,
         height: 50,
         windowWidth: 200,
+        windowHeight: 50,
       });
     });
 
     it("skips malformed and non-pane lines", () => {
-      const panes = parseTmuxPaneGeometry("garbage\n\n%1|80|0|120|50|200\nwindow|1|2|3|4|5");
+      const panes = parseTmuxPaneGeometry(
+        "garbage\n\n%1|80|0|120|50|200|50\nwindow|1|2|3|4|5|5",
+      );
       assert.equal(panes.length, 1);
       assert.equal(panes[0].paneId, "%1");
     });
@@ -3030,6 +3379,561 @@ describe("cmux.ts", () => {
     it("returns no ops when the parent pane is missing", () => {
       const panes = makePanes(200, [{ paneId: C1, left: 0, width: 200 }]);
       assert.equal(planTmuxRebalance(panes, PARENT, 0.4).length, 0);
+    });
+  });
+});
+
+describe("tiled grid layout", () => {
+  describe("gridDimsForCount", () => {
+    it("picks ceil(sqrt(n)) columns and fills row-major", () => {
+      assert.deepEqual(gridDimsForCount(1), { cols: 1, rows: 1 });
+      assert.deepEqual(gridDimsForCount(2), { cols: 2, rows: 1 });
+      assert.deepEqual(gridDimsForCount(3), { cols: 2, rows: 2 });
+      assert.deepEqual(gridDimsForCount(4), { cols: 2, rows: 2 });
+      assert.deepEqual(gridDimsForCount(5), { cols: 3, rows: 2 });
+      assert.deepEqual(gridDimsForCount(6), { cols: 3, rows: 2 });
+      assert.deepEqual(gridDimsForCount(7), { cols: 3, rows: 3 });
+      assert.deepEqual(gridDimsForCount(9), { cols: 3, rows: 3 });
+    });
+
+    it("clamps degenerate inputs", () => {
+      assert.deepEqual(gridDimsForCount(0), { cols: 1, rows: 1 });
+      assert.deepEqual(gridDimsForCount(-3), { cols: 1, rows: 1 });
+    });
+  });
+
+  describe("planGridTargets", () => {
+    it("assigns the parent a left strip and equal row-major cells", () => {
+      const targets = planGridTargets(
+        ["%1", "%2", "%3", "%4"],
+        { x: 0, y: 0, width: 200, height: 50 },
+        0.4,
+      );
+      assert.ok(targets);
+      assert.deepEqual(targets.parentRect, {
+        x: 0,
+        y: 0,
+        width: 80,
+        height: 50,
+      });
+      assert.deepEqual(targets.cells.get("%1"), {
+        x: 80,
+        y: 0,
+        width: 60,
+        height: 25,
+      });
+      assert.deepEqual(targets.cells.get("%2"), {
+        x: 140,
+        y: 0,
+        width: 60,
+        height: 25,
+      });
+      assert.deepEqual(targets.cells.get("%3"), {
+        x: 80,
+        y: 25,
+        width: 60,
+        height: 25,
+      });
+      assert.deepEqual(targets.cells.get("%4"), {
+        x: 140,
+        y: 25,
+        width: 60,
+        height: 25,
+      });
+    });
+
+    it("returns null with no panes", () => {
+      assert.equal(
+        planGridTargets([], { x: 0, y: 0, width: 200, height: 50 }, 0.4),
+        null,
+      );
+    });
+
+    it("returns null when cells would be too small", () => {
+      assert.equal(
+        planGridTargets(
+          ["%1", "%2", "%3", "%4"],
+          { x: 0, y: 0, width: 30, height: 10 },
+          0.4,
+        ),
+        null,
+      );
+    });
+
+    it("absorbs the unclaimed cell below when the grid just grew a row", () => {
+      // 3 panes in a 2×2 grid: pane 2 (top-right) stretches over the empty
+      // bottom-right cell; pane 3 keeps a single bottom-left cell.
+      const targets = planGridTargets(
+        ["%1", "%2", "%3"],
+        { x: 0, y: 0, width: 200, height: 50 },
+        0.4,
+      );
+      assert.ok(targets);
+      assert.deepEqual(targets.cells.get("%1"), {
+        x: 80,
+        y: 0,
+        width: 60,
+        height: 25,
+      });
+      assert.deepEqual(targets.cells.get("%2"), {
+        x: 140,
+        y: 0,
+        width: 60,
+        height: 50,
+      });
+      assert.deepEqual(targets.cells.get("%3"), {
+        x: 80,
+        y: 25,
+        width: 60,
+        height: 25,
+      });
+    });
+
+    it("absorbs the unclaimed cell beside when the grid just grew a column", () => {
+      // 5 panes in a 2×3 grid: pane 4 (bottom-middle) stretches over the empty
+      // bottom-right cell; panes 1–3 and 5 keep single cells.
+      const targets = planGridTargets(
+        ["%1", "%2", "%3", "%4", "%5"],
+        { x: 0, y: 0, width: 200, height: 50 },
+        0.4,
+      );
+      assert.ok(targets);
+      assert.deepEqual(targets.cells.get("%1"), {
+        x: 80,
+        y: 0,
+        width: 40,
+        height: 25,
+      });
+      assert.deepEqual(targets.cells.get("%2"), {
+        x: 120,
+        y: 0,
+        width: 40,
+        height: 25,
+      });
+      assert.deepEqual(targets.cells.get("%3"), {
+        x: 80,
+        y: 25,
+        width: 40,
+        height: 25,
+      });
+      assert.deepEqual(targets.cells.get("%4"), {
+        x: 120,
+        y: 25,
+        width: 80,
+        height: 25,
+      });
+      assert.deepEqual(targets.cells.get("%5"), {
+        x: 160,
+        y: 0,
+        width: 40,
+        height: 25,
+      });
+    });
+
+    it("keeps every pane in the cell it was spawned into as the grid grows", () => {
+      // 6 panes exactly fill the 2×3 grid; all cells are single-cell.
+      const targets = planGridTargets(
+        ["%1", "%2", "%3", "%4", "%5", "%6"],
+        { x: 0, y: 0, width: 200, height: 50 },
+        0.4,
+      );
+      assert.ok(targets);
+      const paneIds = ["%1", "%2", "%3", "%4", "%5", "%6"];
+      const expected = [
+        { x: 80, y: 0, width: 40, height: 25 },
+        { x: 120, y: 0, width: 40, height: 25 },
+        { x: 80, y: 25, width: 40, height: 25 },
+        { x: 120, y: 25, width: 40, height: 25 },
+        { x: 160, y: 0, width: 40, height: 25 },
+        { x: 160, y: 25, width: 40, height: 25 },
+      ];
+      for (const [i, paneId] of paneIds.entries()) {
+        assert.deepEqual(targets.cells.get(paneId), expected[i], paneId);
+      }
+    });
+  });
+
+  describe("selectTiledGridAnchor", () => {
+    // Region right of a 0.4 parent in a 200×50 tab: x 80..200, full height.
+    const REGION = { x: 80, y: 0, width: 120, height: 50 };
+
+    it("returns null when nothing is placed yet or count is not growing", () => {
+      assert.equal(selectTiledGridAnchor([], REGION, 1), null);
+      const placed = [
+        { paneId: "%1", rect: { x: 80, y: 0, width: 120, height: 50 } },
+      ];
+      assert.equal(selectTiledGridAnchor(placed, REGION, 1), null);
+    });
+
+    it("returns null when the region is too small for the grid", () => {
+      const placed = [
+        { paneId: "%1", rect: { x: 80, y: 0, width: 120, height: 50 } },
+      ];
+      assert.equal(
+        selectTiledGridAnchor(
+          placed,
+          { x: 80, y: 0, width: 30, height: 50 },
+          9,
+        ),
+        null,
+      );
+    });
+
+    it("splits the lone full pane right for subagent 2", () => {
+      const placed = [
+        { paneId: "%1", rect: { x: 80, y: 0, width: 120, height: 50 } },
+      ];
+      assert.deepEqual(selectTiledGridAnchor(placed, REGION, 2), {
+        anchorPaneId: "%1",
+        direction: "right",
+      });
+    });
+
+    it("splits down for subagent 3 (start of the second row)", () => {
+      const placed = [
+        { paneId: "%1", rect: { x: 80, y: 0, width: 120, height: 50 } },
+      ];
+      assert.deepEqual(selectTiledGridAnchor(placed, REGION, 3), {
+        anchorPaneId: "%1",
+        direction: "down",
+      });
+    });
+
+    it("completes the 2×2 grid for subagent 4 via a down split", () => {
+      // After 3 panes: top-left, bottom-left, and a full-height right column.
+      const placed = [
+        { paneId: "%1", rect: { x: 80, y: 0, width: 60, height: 25 } },
+        { paneId: "%2", rect: { x: 140, y: 0, width: 60, height: 50 } },
+        { paneId: "%3", rect: { x: 80, y: 25, width: 60, height: 25 } },
+      ];
+      assert.deepEqual(selectTiledGridAnchor(placed, REGION, 4), {
+        anchorPaneId: "%2",
+        direction: "down",
+      });
+    });
+
+    it("grows a third column for subagent 5 on a full 2×2 grid", () => {
+      const placed = [
+        { paneId: "%1", rect: { x: 80, y: 0, width: 60, height: 25 } },
+        { paneId: "%2", rect: { x: 140, y: 0, width: 60, height: 25 } },
+        { paneId: "%3", rect: { x: 80, y: 25, width: 60, height: 25 } },
+        { paneId: "%4", rect: { x: 140, y: 25, width: 60, height: 25 } },
+      ];
+      // Growth spawn: pane 5 claims the new column's top cell, carved out of
+      // the pane beside the region's right edge (%2).
+      assert.deepEqual(selectTiledGridAnchor(placed, REGION, 5), {
+        anchorPaneId: "%2",
+        direction: "right",
+      });
+    });
+
+    it("fills the new column's bottom cell for subagent 6", () => {
+      // After 5 panes: the bottom-right pane stretches across two cells.
+      const placed = [
+        { paneId: "%1", rect: { x: 80, y: 0, width: 40, height: 25 } },
+        { paneId: "%2", rect: { x: 120, y: 0, width: 40, height: 25 } },
+        { paneId: "%5", rect: { x: 160, y: 0, width: 40, height: 25 } },
+        { paneId: "%3", rect: { x: 80, y: 25, width: 40, height: 25 } },
+        { paneId: "%4", rect: { x: 120, y: 25, width: 80, height: 25 } },
+      ];
+      assert.deepEqual(selectTiledGridAnchor(placed, REGION, 6), {
+        anchorPaneId: "%4",
+        direction: "right",
+      });
+    });
+  });
+
+  describe("planHerdrGridRebalance", () => {
+    const PARENT = "%0";
+
+    function makeGridLayout(
+      panes: Array<{
+        pane_id: string;
+        rect: { x: number; y: number; width: number; height: number };
+      }>,
+      splits: Array<{
+        id: string;
+        direction: "right" | "down";
+        ratio: number;
+        rect: { x: number; y: number; width: number; height: number };
+      }>,
+    ) {
+      return {
+        area: { x: 0, y: 0, width: 200, height: 50 },
+        panes,
+        splits,
+        tab_id: "w1:t1",
+        zoomed: false,
+      } as any;
+    }
+
+    function quadrantLayout(ratioColSplit: number) {
+      // 2×2 grid: parent | col A (S1 over S3) | col B (S2 over S4)
+      const colARight = 80 + 120 * ratioColSplit;
+      return makeGridLayout(
+        [
+          { pane_id: PARENT, rect: { x: 0, y: 0, width: 80, height: 50 } },
+          {
+            pane_id: "%1",
+            rect: { x: 80, y: 0, width: colARight - 80, height: 25 },
+          },
+          {
+            pane_id: "%3",
+            rect: { x: 80, y: 25, width: colARight - 80, height: 25 },
+          },
+          {
+            pane_id: "%2",
+            rect: { x: colARight, y: 0, width: 200 - colARight, height: 25 },
+          },
+          {
+            pane_id: "%4",
+            rect: { x: colARight, y: 25, width: 200 - colARight, height: 25 },
+          },
+        ],
+        [
+          {
+            id: "s0",
+            direction: "right",
+            ratio: 0.4,
+            rect: { x: 0, y: 0, width: 200, height: 50 },
+          },
+          {
+            id: "s1",
+            direction: "right",
+            ratio: ratioColSplit,
+            rect: { x: 80, y: 0, width: 120, height: 50 },
+          },
+          {
+            id: "s2",
+            direction: "down",
+            ratio: 0.5,
+            rect: { x: 80, y: 0, width: colARight - 80, height: 50 },
+          },
+          {
+            id: "s3",
+            direction: "down",
+            ratio: 0.5,
+            rect: { x: colARight, y: 0, width: 200 - colARight, height: 50 },
+          },
+        ],
+      );
+    }
+
+    it("emits no ops when the 2×2 grid is already balanced", () => {
+      const layout = quadrantLayout(0.5);
+      const ops = planHerdrGridRebalance(
+        layout,
+        PARENT,
+        ["%1", "%2", "%3", "%4"],
+        0.4,
+      );
+      assert.equal(ops.length, 0);
+    });
+
+    it("evens out unbalanced columns without touching a correct parent strip", () => {
+      // Column split at 0.6: left column too wide (72), right too narrow (48);
+      // parent is already at its 0.4 target, so no parent op is emitted.
+      const layout = quadrantLayout(0.6);
+      const ops = planHerdrGridRebalance(
+        layout,
+        PARENT,
+        ["%1", "%2", "%3", "%4"],
+        0.4,
+      );
+      assert.equal(ops.length, 1);
+      assert.equal(ops[0].paneId, "%2");
+      assert.equal(ops[0].direction, "left");
+      assert.ok(Math.abs(ops[0].amount - 0.1) < 1e-9);
+    });
+
+    it("emits a vertical up op for an unbalanced row divider", () => {
+      // Masonry after 3 spawns: S1a over S3 on the left, full-height S2 right.
+      // Parent strip and column split are already at target; only the row
+      // divider (ratio 0.6, y=30) needs to move to 0.5 (y=25).
+      const layout = makeGridLayout(
+        [
+          { pane_id: PARENT, rect: { x: 0, y: 0, width: 80, height: 50 } },
+          { pane_id: "%1", rect: { x: 80, y: 0, width: 60, height: 30 } },
+          { pane_id: "%3", rect: { x: 80, y: 30, width: 60, height: 20 } },
+          { pane_id: "%2", rect: { x: 140, y: 0, width: 60, height: 50 } },
+        ],
+        [
+          {
+            id: "s0",
+            direction: "right",
+            ratio: 0.4,
+            rect: { x: 0, y: 0, width: 200, height: 50 },
+          },
+          {
+            id: "s1",
+            direction: "right",
+            ratio: 0.5,
+            rect: { x: 80, y: 0, width: 120, height: 50 },
+          },
+          {
+            id: "s2",
+            direction: "down",
+            ratio: 0.6,
+            rect: { x: 80, y: 0, width: 60, height: 50 },
+          },
+        ],
+      );
+      const ops = planHerdrGridRebalance(
+        layout,
+        PARENT,
+        ["%1", "%2", "%3"],
+        0.4,
+      );
+      assert.equal(ops.length, 1);
+      assert.equal(ops[0].paneId, "%3");
+      assert.equal(ops[0].direction, "up");
+      assert.ok(Math.abs(ops[0].amount - 0.1) < 1e-9);
+    });
+
+    it("freezes untracked panes and returns no ops for an empty grid", () => {
+      const layout = quadrantLayout(0.5);
+      assert.equal(planHerdrGridRebalance(layout, PARENT, [], 0.4).length, 0);
+    });
+  });
+
+  describe("planTmuxGridRebalance", () => {
+    const PARENT = "%0";
+
+    function makePanes2D(
+      windowWidth: number,
+      windowHeight: number,
+      panes: Array<{
+        paneId: string;
+        left: number;
+        top?: number;
+        width: number;
+        height?: number;
+      }>,
+    ) {
+      return panes.map((p) => ({
+        paneId: p.paneId,
+        left: p.left,
+        top: p.top ?? 0,
+        width: p.width,
+        height: p.height ?? windowHeight,
+        windowWidth,
+        windowHeight,
+      }));
+    }
+
+    it("emits no ops when the 2×2 grid is already balanced", () => {
+      const panes = makePanes2D(200, 50, [
+        { paneId: PARENT, left: 0, width: 80 },
+        { paneId: "%1", left: 80, width: 60, height: 25 },
+        { paneId: "%2", left: 140, width: 60, height: 25 },
+        { paneId: "%3", left: 80, top: 25, width: 60, height: 25 },
+        { paneId: "%4", left: 140, top: 25, width: 60, height: 25 },
+      ]);
+      const ops = planTmuxGridRebalance(
+        panes,
+        PARENT,
+        ["%1", "%2", "%3", "%4"],
+        0.4,
+      );
+      assert.equal(ops.length, 0);
+    });
+
+    it("plans width and height ops toward equal cells", () => {
+      const panes = makePanes2D(200, 50, [
+        { paneId: PARENT, left: 0, width: 80 },
+        { paneId: "%1", left: 80, width: 70, height: 30 },
+        { paneId: "%2", left: 150, width: 50, height: 30 },
+        { paneId: "%3", left: 80, top: 30, width: 70, height: 20 },
+        { paneId: "%4", left: 150, top: 30, width: 50, height: 20 },
+      ]);
+      const ops = planTmuxGridRebalance(
+        panes,
+        PARENT,
+        ["%1", "%2", "%3", "%4"],
+        0.4,
+      );
+      assert.deepEqual(ops, [
+        { paneId: "%1", width: 60, height: 25 },
+        { paneId: "%2", width: 60, height: 25 },
+        { paneId: "%3", width: 60, height: 25 },
+        { paneId: "%4", width: 60, height: 25 },
+      ]);
+    });
+
+    it("skips the masonry pane that runs to the region's bottom edge", () => {
+      // 3 panes: two stacked on the left, one full-height on the right — the
+      // tall pane's height target would shrink it toward the window edge.
+      const panes = makePanes2D(200, 50, [
+        { paneId: PARENT, left: 0, width: 80 },
+        { paneId: "%1", left: 80, width: 60, height: 25 },
+        { paneId: "%2", left: 140, width: 60 },
+        { paneId: "%3", left: 80, top: 25, width: 60, height: 25 },
+      ]);
+      const ops = planTmuxGridRebalance(panes, PARENT, ["%1", "%2", "%3"], 0.4);
+      assert.equal(ops.length, 0);
+    });
+
+    it("bails when unmanaged panes occupy the subagent region", () => {
+      // A user-made pane sits right of the parent — resizing around it would
+      // wreck the layout, so no ops are emitted.
+      const panes = makePanes2D(240, 50, [
+        { paneId: PARENT, left: 0, width: 96 },
+        { paneId: "%1", left: 96, width: 72 },
+        { paneId: "%9", left: 168, width: 72 },
+      ]);
+      const ops = planTmuxGridRebalance(panes, PARENT, ["%1"], 0.4);
+      assert.equal(ops.length, 0);
+    });
+
+    it("returns no ops when the parent pane is missing", () => {
+      const panes = makePanes2D(200, 50, [
+        { paneId: "%1", left: 0, width: 200 },
+      ]);
+      assert.equal(planTmuxGridRebalance(panes, PARENT, ["%1"], 0.4).length, 0);
+    });
+  });
+
+  describe("layout mode persistence", () => {
+    const LAYOUT_KEY = Symbol.for("pi-subagents/layout-mode");
+
+    it("defaults to columns, honors PI_SUBAGENT_LAYOUT, and persists toggles", () => {
+      const store = globalThis as Record<symbol, unknown>;
+      const prevConfigDir = process.env.PI_CODING_AGENT_DIR;
+      const prevLayoutEnv = process.env.PI_SUBAGENT_LAYOUT;
+      const prevMode = store[LAYOUT_KEY];
+      const dir = mkdtempSync(join(tmpdir(), "subagents-layout-"));
+      try {
+        process.env.PI_CODING_AGENT_DIR = dir;
+        delete process.env.PI_SUBAGENT_LAYOUT;
+        delete store[LAYOUT_KEY];
+        assert.equal(getSubagentLayoutMode(), "columns");
+
+        process.env.PI_SUBAGENT_LAYOUT = "tiled";
+        delete store[LAYOUT_KEY];
+        assert.equal(getSubagentLayoutMode(), "tiled");
+
+        // /subagent-layout persists — the file wins over the env default.
+        setSubagentLayoutMode("columns");
+        delete store[LAYOUT_KEY];
+        assert.equal(getSubagentLayoutMode(), "columns");
+        assert.deepEqual(
+          JSON.parse(readFileSync(join(dir, "subagents-layout.json"), "utf8")),
+          {
+            mode: "columns",
+          },
+        );
+
+        setSubagentLayoutMode("tiled");
+        assert.equal(getSubagentLayoutMode(), "tiled");
+      } finally {
+        if (prevConfigDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+        else process.env.PI_CODING_AGENT_DIR = prevConfigDir;
+        if (prevLayoutEnv === undefined) delete process.env.PI_SUBAGENT_LAYOUT;
+        else process.env.PI_SUBAGENT_LAYOUT = prevLayoutEnv;
+        if (prevMode === undefined) delete store[LAYOUT_KEY];
+        else store[LAYOUT_KEY] = prevMode;
+        rmSync(dir, { recursive: true, force: true });
+      }
     });
   });
 });

@@ -1,5 +1,11 @@
-import { appendFileSync, copyFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { randomBytes, randomUUID } from "node:crypto";
+import {
+  appendFileSync,
+  copyFileSync,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 
 export interface SessionEntry {
@@ -59,11 +65,12 @@ export function seedSubagentSessionFile(params: {
     cwd: params.childCwd,
     parentSession: params.parentSessionFile,
   };
-  const contentLines = params.mode === "fork" ? getForkContentLines(params.parentSessionFile) : [];
+  const contentLines =
+    params.mode === "fork" ? getForkContentLines(params.parentSessionFile) : [];
   const lines = [JSON.stringify(header), ...contentLines];
 
   mkdirSync(dirname(params.childSessionFile), { recursive: true });
-  writeFileSync(params.childSessionFile, lines.join("\n") + "\n", "utf8");
+  writeFileSync(params.childSessionFile, `${lines.join("\n")}\n`, "utf8");
 }
 
 function readEntries(sessionFile: string): SessionEntry[] {
@@ -85,7 +92,10 @@ export function getLeafId(sessionFile: string): string | null {
 /**
  * Return entries added after `afterLine` (1-indexed count of existing entries).
  */
-export function getNewEntries(sessionFile: string, afterLine: number): SessionEntry[] {
+export function getNewEntries(
+  sessionFile: string,
+  afterLine: number,
+): SessionEntry[] {
   const raw = readFileSync(sessionFile, "utf8");
   const lines = raw.split("\n").filter((line) => line.trim());
   return lines.slice(afterLine).map((line) => JSON.parse(line) as SessionEntry);
@@ -99,7 +109,9 @@ export function getNewEntries(sessionFile: string, afterLine: number): SessionEn
  * auto-retry exhausts on a provider overload / rate limit / server error, and
  * without this fallback the parent would silently see a stale earlier message.
  */
-export function findLastAssistantMessage(entries: SessionEntry[]): string | null {
+export function findLastAssistantMessage(
+  entries: SessionEntry[],
+): string | null {
   for (let i = entries.length - 1; i >= 0; i--) {
     const entry = entries[i];
     if (entry.type !== "message") continue;
@@ -109,15 +121,22 @@ export function findLastAssistantMessage(entries: SessionEntry[]): string | null
     const texts = msg.message.content
       .filter(
         (block) =>
-          block.type === "text" && typeof block.text === "string" && block.text.trim() !== "",
+          block.type === "text" &&
+          typeof block.text === "string" &&
+          block.text.trim() !== "",
       )
       .map((block) => block.text as string);
 
     if (texts.length > 0 && texts.join("").trim()) return texts.join("\n");
 
     const stopReason = (msg.message as { stopReason?: unknown }).stopReason;
-    const errorMessage = (msg.message as { errorMessage?: unknown }).errorMessage;
-    if (stopReason === "error" && typeof errorMessage === "string" && errorMessage.trim() !== "") {
+    const errorMessage = (msg.message as { errorMessage?: unknown })
+      .errorMessage;
+    if (
+      stopReason === "error" &&
+      typeof errorMessage === "string" &&
+      errorMessage.trim() !== ""
+    ) {
       return `Subagent error: ${errorMessage.trim()}`;
     }
   }
@@ -143,7 +162,7 @@ export function appendBranchSummary(
     fromId: fromId ?? branchPointId,
     summary,
   };
-  appendFileSync(sessionFile, JSON.stringify(entry) + "\n", "utf8");
+  appendFileSync(sessionFile, `${JSON.stringify(entry)}\n`, "utf8");
   return id;
 }
 
@@ -169,7 +188,7 @@ export function mergeNewEntries(
 ): SessionEntry[] {
   const entries = getNewEntries(sourceFile, afterLine);
   for (const entry of entries) {
-    appendFileSync(targetFile, JSON.stringify(entry) + "\n", "utf8");
+    appendFileSync(targetFile, `${JSON.stringify(entry)}\n`, "utf8");
   }
   return entries;
 }

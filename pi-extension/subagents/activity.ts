@@ -9,7 +9,12 @@ import {
 import { dirname, join } from "node:path";
 
 export type SubagentActivityPhase = "starting" | "active" | "waiting" | "done";
-export type SubagentActivityScope = "agent" | "turn" | "provider" | "streaming" | "tool";
+export type SubagentActivityScope =
+  | "agent"
+  | "turn"
+  | "provider"
+  | "streaming"
+  | "tool";
 
 export type SubagentActivityEvent =
   | "session_start"
@@ -58,7 +63,12 @@ export type ActivityReadResult =
   | { ok: true; activity: SubagentActivityState }
   | { ok: false; reason: "missing" | "invalid" | "wrong-id"; error?: string };
 
-export type SubagentShutdownReason = "quit" | "reload" | "new" | "resume" | "fork";
+export type SubagentShutdownReason =
+  | "quit"
+  | "reload"
+  | "new"
+  | "resume"
+  | "fork";
 
 export interface SubagentActivityRecorder {
   sessionStart(): void;
@@ -79,12 +89,22 @@ export interface SubagentActivityRecorder {
   toolExecutionEnd(toolCallId?: string, toolName?: string): void;
   callerPing(): void;
   subagentDone(): void;
-  sessionShutdown(reason: SubagentShutdownReason): void;
+  /**
+   * Record shutdown. `reason` is only passed by callers that know why the
+   * session ended; pi's session_shutdown event carries no reason, in which
+   * case the recorder just stops writing without marking the phase done.
+   */
+  sessionShutdown(reason?: SubagentShutdownReason): void;
 }
 
 const ACTIVITY_UPDATE_THROTTLE_MS = 500;
 const MAX_WRITE_FAILURES = 3;
-const KNOWN_PHASES = new Set<SubagentActivityPhase>(["starting", "active", "waiting", "done"]);
+const KNOWN_PHASES = new Set<SubagentActivityPhase>([
+  "starting",
+  "active",
+  "waiting",
+  "done",
+]);
 const KNOWN_SCOPES = new Set<SubagentActivityScope>([
   "agent",
   "turn",
@@ -114,17 +134,26 @@ const KNOWN_EVENTS = new Set<SubagentActivityEvent>([
 ]);
 const MAX_ACTIVITY_STRING_LENGTH = 200;
 
-export function getSubagentActivityFile(artifactDir: string, runningChildId: string): string {
+export function getSubagentActivityFile(
+  artifactDir: string,
+  runningChildId: string,
+): string {
   return join(artifactDir, "subagent-activity", `${runningChildId}.json`);
 }
 
 function requireObject(value: unknown): Record<string, unknown> | null {
-  if (value == null || typeof value !== "object" || Array.isArray(value)) return null;
+  if (value == null || typeof value !== "object" || Array.isArray(value))
+    return null;
   return value as Record<string, unknown>;
 }
 
-function validateFiniteNumber(object: Record<string, unknown>, fieldName: string): string | null {
-  return Number.isFinite(object[fieldName]) ? null : `${fieldName} must be finite`;
+function validateFiniteNumber(
+  object: Record<string, unknown>,
+  fieldName: string,
+): string | null {
+  return Number.isFinite(object[fieldName])
+    ? null
+    : `${fieldName} must be finite`;
 }
 
 function validateOptionalFiniteNumber(
@@ -137,8 +166,13 @@ function validateOptionalFiniteNumber(
     : `${fieldName} must be finite when present`;
 }
 
-function validateInteger(object: Record<string, unknown>, fieldName: string): string | null {
-  return Number.isInteger(object[fieldName]) ? null : `${fieldName} must be an integer`;
+function validateInteger(
+  object: Record<string, unknown>,
+  fieldName: string,
+): string | null {
+  return Number.isInteger(object[fieldName])
+    ? null
+    : `${fieldName} must be an integer`;
 }
 
 function validateOptionalInteger(
@@ -151,8 +185,13 @@ function validateOptionalInteger(
     : `${fieldName} must be an integer when present`;
 }
 
-function validateBoolean(object: Record<string, unknown>, fieldName: string): string | null {
-  return typeof object[fieldName] === "boolean" ? null : `${fieldName} must be a boolean`;
+function validateBoolean(
+  object: Record<string, unknown>,
+  fieldName: string,
+): string | null {
+  return typeof object[fieldName] === "boolean"
+    ? null
+    : `${fieldName} must be a boolean`;
 }
 
 function validateOptionalActivityString(
@@ -161,22 +200,30 @@ function validateOptionalActivityString(
 ): string | null {
   const value = object[fieldName];
   if (value == null) return null;
-  if (typeof value !== "string") return `${fieldName} must be a string when present`;
+  if (typeof value !== "string")
+    return `${fieldName} must be a string when present`;
   if (/\r|\n/.test(value)) return `${fieldName} must not contain newlines`;
-  return value.length <= MAX_ACTIVITY_STRING_LENGTH ? null : `${fieldName} is too long`;
+  return value.length <= MAX_ACTIVITY_STRING_LENGTH
+    ? null
+    : `${fieldName} is too long`;
 }
 
 function invalidActivity(error: string): ActivityReadResult {
   return { ok: false, reason: "invalid", error };
 }
 
-function validateActivity(value: unknown, expectedRunningChildId: string): ActivityReadResult {
+function validateActivity(
+  value: unknown,
+  expectedRunningChildId: string,
+): ActivityReadResult {
   const object = requireObject(value);
   if (!object) return invalidActivity("activity must be an object");
-  if (object.version !== 1) return invalidActivity("unsupported activity version");
+  if (object.version !== 1)
+    return invalidActivity("unsupported activity version");
   if (typeof object.runningChildId !== "string")
     return invalidActivity("runningChildId must be a string");
-  if (object.runningChildId !== expectedRunningChildId) return { ok: false, reason: "wrong-id" };
+  if (object.runningChildId !== expectedRunningChildId)
+    return { ok: false, reason: "wrong-id" };
   if (
     typeof object.latestEvent !== "string" ||
     !KNOWN_EVENTS.has(object.latestEvent as SubagentActivityEvent)
@@ -327,7 +374,8 @@ function markActive(
 ): void {
   activity.phase = "active";
   activity.activeScope = scope;
-  if (activity.activeSince == null || resetActiveSince) activity.activeSince = now;
+  if (activity.activeSince == null || resetActiveSince)
+    activity.activeSince = now;
   delete activity.waitingSince;
 }
 
@@ -387,7 +435,10 @@ export function createSubagentActivityRecorder(params: {
   function scheduleFlush(): void {
     if (disabled || pendingFlush) return;
 
-    const remainingMs = Math.max(0, ACTIVITY_UPDATE_THROTTLE_MS - (now() - lastFlushAt));
+    const remainingMs = Math.max(
+      0,
+      ACTIVITY_UPDATE_THROTTLE_MS - (now() - lastFlushAt),
+    );
     if (remainingMs === 0) {
       flushNow();
       return;
@@ -488,7 +539,9 @@ export function createSubagentActivityRecorder(params: {
           if (turnIndex != null) current.turnIndex = turnIndex;
           markActive(
             current,
-            current.toolActive || current.providerActive ? (current.activeScope ?? "turn") : "turn",
+            current.toolActive || current.providerActive
+              ? (current.activeScope ?? "turn")
+              : "turn",
             observedAt,
           );
         },

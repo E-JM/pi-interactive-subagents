@@ -10,34 +10,35 @@
  *   tmux new 'npm run test:integration'
  *   zellij --session pi  # then run: npm run test:integration
  */
-import { describe, it, before, after } from "node:test";
+
 import assert from "node:assert/strict";
 import { unlinkSync } from "node:fs";
+import { after, before, describe, it } from "node:test";
 import {
-  getAvailableBackends,
-  setBackend,
-  restoreBackend,
-  createTestEnv,
   cleanupTestEnv,
+  closeSurface,
+  createTestEnv,
   createTrackedSurface,
   createTrackedSurfaceSplit,
   focusSurface,
+  getAvailableBackends,
   getFocusedSurface,
   getSurfacePane,
-  waitForFocusedSurface,
-  untrackSurface,
-  sendCommand,
-  sendLongCommand,
   readScreen,
   readScreenAsync,
-  closeSurface,
+  restoreBackend,
+  sendCommand,
   sendEscape,
+  sendLongCommand,
+  setBackend,
   sleep,
-  uniqueId,
-  trackTempFile,
-  waitForFile,
-  waitForScreen,
   type TestEnv,
+  trackTempFile,
+  uniqueId,
+  untrackSurface,
+  waitForFile,
+  waitForFocusedSurface,
+  waitForScreen,
 } from "./harness.ts";
 
 const backends = getAvailableBackends();
@@ -46,7 +47,9 @@ const FOCUS_TEST_SHELL_READY_DELAY_MS = Number(
 );
 
 if (backends.length === 0) {
-  console.log("⚠️  No mux backend available — skipping mux-surface integration tests");
+  console.log(
+    "⚠️  No mux backend available — skipping mux-surface integration tests",
+  );
   console.log("   Run inside cmux or tmux to enable these tests.");
 }
 
@@ -133,9 +136,15 @@ for (const backend of backends) {
       await sleep(1500);
 
       const screen = readScreen(surface, 50);
-      assert.ok(screen.includes(`SPEC_${marker}`), `Expected special-char output. Got:\n${screen}`);
+      assert.ok(
+        screen.includes(`SPEC_${marker}`),
+        `Expected special-char output. Got:\n${screen}`,
+      );
       // $ should be literal inside single quotes
-      assert.ok(screen.includes("$HOME"), `Expected literal $HOME in output. Got:\n${screen}`);
+      assert.ok(
+        screen.includes("$HOME"),
+        `Expected literal $HOME in output. Got:\n${screen}`,
+      );
     });
 
     it("sends a long command via script file without truncation", async () => {
@@ -189,8 +198,14 @@ for (const backend of backends) {
       const screen1 = readScreen(s1, 50);
       const screen2 = readScreen(s2, 50);
 
-      assert.ok(screen1.includes(`S1_${m1}`), `Surface 1 missing marker. Got:\n${screen1}`);
-      assert.ok(screen2.includes(`S2_${m2}`), `Surface 2 missing marker. Got:\n${screen2}`);
+      assert.ok(
+        screen1.includes(`S1_${m1}`),
+        `Surface 1 missing marker. Got:\n${screen1}`,
+      );
+      assert.ok(
+        screen2.includes(`S2_${m2}`),
+        `Surface 2 missing marker. Got:\n${screen2}`,
+      );
     });
 
     it("writes output to a file and verifies via surface", async () => {
@@ -200,11 +215,21 @@ for (const backend of backends) {
       const marker = uniqueId();
       const filePath = `/tmp/pi-mux-test-${marker}.txt`;
 
-      sendCommand(surface, `echo "FILE_${marker}" > ${filePath} && echo "WRITTEN_${marker}"`);
+      sendCommand(
+        surface,
+        `echo "FILE_${marker}" > ${filePath} && echo "WRITTEN_${marker}"`,
+      );
 
       await waitForScreen(surface, new RegExp(`WRITTEN_${marker}`), 10_000, 50);
-      const content = await waitForFile(filePath, 10_000, new RegExp(`FILE_${marker}`));
-      assert.ok(content.includes(`FILE_${marker}`), `File content wrong. Got: ${content}`);
+      const content = await waitForFile(
+        filePath,
+        10_000,
+        new RegExp(`FILE_${marker}`),
+      );
+      assert.ok(
+        content.includes(`FILE_${marker}`),
+        `File content wrong. Got: ${content}`,
+      );
 
       // Clean up
       try {
