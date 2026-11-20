@@ -922,6 +922,7 @@ const HERDR_SUBAGENT_PANES_KEY = Symbol.for(
   "pi-subagents/herdr-subagent-panes",
 );
 
+/** Tracked herdr subagent pane ids, in spawn order (grid fill order). */
 function herdrSubagentPaneList(): string[] {
   const store = globalThis as Record<symbol, unknown>;
   if (!Array.isArray(store[HERDR_SUBAGENT_PANES_KEY])) {
@@ -937,11 +938,16 @@ export function setHerdrSubagentPaneList(paneIds: string[]): void {
   ];
 }
 
+/**
+ * Track a spawned herdr subagent pane so layout ops stay in the group
+ * (idempotent).
+ */
 function herdrTrackPane(paneId: string): void {
   const panes = herdrSubagentPaneList();
   if (!panes.includes(paneId)) panes.push(paneId);
 }
 
+/** Forget a herdr subagent pane after its surface closes. */
 function herdrUntrackPane(paneId: string): void {
   setHerdrSubagentPaneList(
     herdrSubagentPaneList().filter((id) => id !== paneId),
@@ -1268,11 +1274,12 @@ export interface TiledAnchorSelection {
 /**
  * Pick which tracked pane to split for subagent #count (1-indexed) in tiled
  * mode, and in which direction. `placed` holds the tracked panes with their
- * current rects in fill order; `region` is the subagent area (right of the
- * parent, full height). The anchor is the pane overlapping the target cell
- * the most (ties: smaller pane, then fill order); the direction is whichever
- * half-split of the anchor contains more of the target cell. Returns null
- * when tiling isn't possible and the caller should fall back to columns.
+ * current rects in fill order; `region` is the subagent area — right of the
+ * parent, inside the group region. The anchor is the pane overlapping the
+ * target cell the most (ties: smaller pane, then fill order); the direction
+ * is whichever half-split of the anchor contains more of the target cell.
+ * Returns null when tiling isn't possible and the caller should fall back
+ * to columns.
  */
 export function selectTiledGridAnchor(
   placed: PlacedPane[],
@@ -1437,9 +1444,9 @@ function herdrBalancePreflight(
 }
 
 /**
- * Width target per pane for the single-row column layout (parent at
+ * Width target per pane for the single-row column layout: parent at
  * `parentRatio` of the group region, each tracked column cell sharing the
- * rest, panes inside the region that we don't manage keep their width).
+ * rest equally, foreign panes inside the region keeping their width.
  * Returns null when there is nothing to balance or the targets cannot fit.
  */
 function herdrColumnTargets(
@@ -1465,9 +1472,9 @@ function herdrColumnTargets(
     )
     .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
 
-  // Panes we won't move (untracked leftovers inside the region — user
-  // splits): keep widths. Panes outside the region (other agents, user
-  // panes) are not part of the group's layout at all.
+  // Foreign panes inside the region (user splits, another agent's panes)
+  // keep their width — the cells share what they leave. Foreign panes
+  // outside the region are not part of the group's layout at all.
   const cellIds = new Set(cells.map((cell) => cell.pane_id));
   if (cellIds.size === 0) return null; // nothing to balance
   const frozenSum = layout.panes
@@ -1489,7 +1496,7 @@ function herdrColumnTargets(
   return (pane: HerdrLayoutPane): number => {
     if (pane.pane_id === parentPaneId) return parentTarget;
     if (cellIds.has(pane.pane_id)) return cellTarget;
-    return pane.rect.width; // frozen, or outside the region — untouched
+    return pane.rect.width; // anything else is foreign: keep current width
   };
 }
 
@@ -1497,8 +1504,8 @@ function herdrColumnTargets(
  * Walk the vertical splits inside `region` outermost-first, moving each
  * divider toward its side's width target. Empty when any divider move is
  * ambiguous — herdr could move either of two coincident dividers, so no op
- * can be trusted. Splits outside the region (dividers shared with panes the
- * group doesn't own) are never walked, so unrelated panes cannot move.
+ * can be trusted. Splits outside the region (dividers shared with foreign
+ * panes) are never walked, so foreign panes cannot move.
  */
 function herdrColumnDividerOps(
   layout: HerdrLayout,
@@ -1558,10 +1565,14 @@ function herdrColumnDividerOps(
       rightLeaves,
     );
 
-    // Skip if another split's divider coincides with this one — herdr could
-    // move either one. Only happens in legacy layouts this code never creates.
+    // The divider anchor must be flush against the divider — herdr resolves
+    // the op by the anchor pane, so a non-adjacent pane would move the wrong
+    // divider. Skip this split rather than guess.
     const anchorEdge = grow ? anchor.rect.x + anchor.rect.width : anchor.rect.x;
     if (Math.abs(anchorEdge - dividerX) > 1.5) continue;
+    // A coincident divider from another split (nested layouts this code
+    // never builds) makes the move ambiguous — herdr could push either one
+    // — so abort the whole plan instead of resizing an arbitrary pane.
     if (hasCoincidentDivider(rightSplits, split, anchor, dividerX)) {
       ambiguous = true;
       break;
@@ -1578,11 +1589,12 @@ function herdrColumnDividerOps(
 
 /**
  * Plan resizes that lay the group's region out as: parent at `parentRatio`
- * width on the left, every tracked full-height pane to its right sharing the
- * rest equally. Each split's ratio is targeted independently, so nesting
- * depth doesn't matter. The region is the bounding rect of the parent and its
- * tracked subagent panes — panes outside it (another agent, user panes) and
- * untracked panes inside it are never moved. Pure — no CLI calls.
+ * width on the left, every tracked column cell to its right sharing the rest
+ * equally. Each split's ratio is targeted independently, so nesting depth
+ * doesn't matter. The region is the bounding rect of the parent and its
+ * tracked subagent panes; foreign panes (another agent, user splits — inside
+ * or outside the region) are never moved. `trackedPaneIds` defaults to the
+ * process's tracked herdr panes. Pure — no CLI calls.
  */
 export function planHerdrRebalance(
   layout: HerdrLayout,
@@ -1746,9 +1758,10 @@ function planDividerOps(
  * `parentRatio` width on the left, tracked panes (fill order) in the
  * `gridDimsForCount` grid (round(sqrt(n)) rows × ceil(n/rows) columns) of
  * equal cells to its right. The region is the bounding rect of the parent
- * and its tracked panes — panes outside it are never touched. Handles both
- * right-splits (vertical dividers) and down-splits (horizontal dividers);
- * untracked panes inside the region are frozen. Pure — no CLI calls.
+ * and its tracked panes — foreign panes are never touched, and a foreign
+ * pane right of the parent inside the region bails the whole plan. Handles
+ * both right-splits (vertical dividers) and down-splits (horizontal
+ * dividers). Pure — no CLI calls.
  */
 export function planHerdrGridRebalance(
   layout: HerdrLayout,
@@ -1764,22 +1777,23 @@ export function planHerdrGridRebalance(
   const tracked = trackedPaneIds.filter((id) =>
     layout.panes.some((pane) => pane.pane_id === id),
   );
-  // Unmanaged panes inside the group region (user splits) — leave the layout
-  // alone. Panes outside the region are not ours to care about.
+  // A foreign pane right of the parent inside the region (a user split in
+  // the grid area) would get wrecked by the rebalance — bail. Foreign panes
+  // elsewhere are not ours to care about.
   const trackedSet = new Set(tracked);
   const parentRight = parent.rect.x + parent.rect.width;
-  const isUnmanagedInRegion = (pane: HerdrLayoutPane): boolean =>
+  const isForeignInRegion = (pane: HerdrLayoutPane): boolean =>
     pane.pane_id !== parentPaneId &&
     !trackedSet.has(pane.pane_id) &&
     paneInRect(pane, region) &&
     pane.rect.x >= parentRight - 1;
-  if (layout.panes.some(isUnmanagedInRegion)) return ops;
+  if (layout.panes.some(isForeignInRegion)) return ops;
   const targets = planGridTargets(tracked, region, parentRatio);
   if (!targets) return ops;
 
   const targetRectOf = (pane: HerdrLayoutPane): HerdrRect => {
     if (pane.pane_id === parentPaneId) return targets.parentRect;
-    return targets.cells.get(pane.pane_id) ?? pane.rect; // frozen when untracked
+    return targets.cells.get(pane.pane_id) ?? pane.rect; // foreign: frozen
   };
 
   const byAreaDesc = (a: HerdrLayoutSplit, b: HerdrLayoutSplit): number =>
@@ -2004,6 +2018,10 @@ function scheduleHerdrDeferredRebalance(parentPaneId: string): void {
   scheduleNext();
 }
 
+/**
+ * Rebalance the herdr tab in the configured layout mode (tiled grid or
+ * equal-width columns). Best effort — never blocks spawning.
+ */
 function rebalanceHerdrLayoutForMode(parentPaneId: string): void {
   if (getSubagentLayoutMode() === "tiled") {
     rebalanceHerdrGridLayout(parentPaneId);
@@ -2015,7 +2033,7 @@ function rebalanceHerdrLayoutForMode(parentPaneId: string): void {
 /**
  * Create a herdr subagent surface. The group (parent + tracked subagent
  * panes) only ever claims the parent's own panel: when the tab is shared
- * with unrelated panes, splits and rebalancing stay inside the group region.
+ * with foreign panes, splits and rebalancing stay inside the group region.
  * In "columns" mode (default) the first subagent splits the parent and new
  * subagents split the rightmost tracked subagent pane; rebalancing keeps the
  * parent at `PI_SUBAGENT_HERDR_PARENT_RATIO` (default 0.4) of the group
@@ -2134,6 +2152,7 @@ function readTmuxPaneGeometry(targetPaneId?: string): TmuxPaneGeometry[] {
 /** Tracked tmux subagent panes; globalThis + Symbol.for so it survives /reload. */
 const TMUX_SUBAGENT_PANES_KEY = Symbol.for("pi-subagents/tmux-subagent-panes");
 
+/** Tracked tmux subagent pane ids, in spawn order (defines grid fill order). */
 function tmuxSubagentPaneList(): string[] {
   const store = globalThis as Record<symbol, unknown>;
   if (!Array.isArray(store[TMUX_SUBAGENT_PANES_KEY])) {
@@ -2149,11 +2168,16 @@ export function setTmuxSubagentPaneList(paneIds: string[]): void {
   ];
 }
 
+/**
+ * Track a spawned tmux subagent pane so layout ops stay in the group
+ * (idempotent).
+ */
 function tmuxTrackPane(paneId: string): void {
   const panes = tmuxSubagentPaneList();
   if (!panes.includes(paneId)) panes.push(paneId);
 }
 
+/** Forget a tmux subagent pane after its surface closes. */
 function tmuxUntrackPane(paneId: string): void {
   setTmuxSubagentPaneList(tmuxSubagentPaneList().filter((id) => id !== paneId));
 }
@@ -2180,8 +2204,9 @@ function tmuxPaneRect(pane: TmuxPaneGeometry): GridRect {
 
 /**
  * The region this agent group owns: the bounding rect (window-relative) of
- * the parent pane and its tracked subagent panes. Foreign panes (another
- * agent, user splits) are never measured into it, split, or resized.
+ * the parent pane and its tracked subagent panes, folded by boundingRect.
+ * Foreign panes (another agent, user splits) are never split or resized;
+ * the rebalance planners only ever measure and move inside this region.
  */
 function tmuxGroupRegion(
   panes: TmuxPaneGeometry[],
@@ -2221,10 +2246,10 @@ function tmuxPaneInRegion(pane: TmuxPaneGeometry, region: GridRect): boolean {
 }
 
 /**
- * Parent pane and the tracked full-height column cells right of it for the
- * single-row column layout, or null when there is nothing to balance or an
- * untracked pane sits inside the region (absolute widths could not be
- * honored without moving it).
+ * Parent pane, group region, and the tracked full-height column cells right
+ * of the parent for the single-row column layout, or null when there is
+ * nothing to balance or a foreign pane sits inside the region (absolute
+ * widths could not be honored without moving it).
  */
 function tmuxColumnLayout(
   panes: TmuxPaneGeometry[],
@@ -2253,8 +2278,8 @@ function tmuxColumnLayout(
     )
     .sort((a, b) => a.top - b.top || a.left - b.left);
   if (cells.length === 0) return null;
-  // Absolute-width resizes cannot leave room for an unmanaged pane inside
-  // the region — bail instead of squeezing a user pane.
+  // Absolute-width resizes cannot leave room for a foreign pane inside the
+  // region — bail instead of squeezing it.
   const foreignInside = panes.some(
     (pane) =>
       pane.paneId !== parentPaneId &&
@@ -2365,10 +2390,10 @@ function tmuxAxisTarget(
 function tmuxGridPaneOp(
   pane: TmuxPaneGeometry,
   cell: GridRect,
-  window: GridRect,
+  region: GridRect,
 ): TmuxGridResizeOp | undefined {
-  const regionRight = window.x + window.width;
-  const regionBottom = window.y + window.height;
+  const regionRight = region.x + region.width;
+  const regionBottom = region.y + region.height;
   const width = tmuxAxisTarget(
     pane.width,
     cell.width,
@@ -2388,9 +2413,10 @@ function tmuxGridPaneOp(
 /**
  * Plan absolute resizes that lay the group's region out as a tiled grid:
  * parent at `parentRatio` width on the left (full height), tracked panes
- * (fill order) in equal cells to its right. Panes outside the region are
- * never touched. Masonry panes tmux cannot shrink away from the region's far
- * edge are left alone; untracked panes are frozen. Pure — no CLI calls.
+ * (fill order) in equal cells to its right. Foreign panes are never touched;
+ * a foreign pane right of the parent inside the region bails the whole plan
+ * (absolute widths cannot be honored around it). Masonry panes tmux cannot
+ * shrink away from the region's far edge are left alone. Pure — no CLI calls.
  */
 export function planTmuxGridRebalance(
   panes: TmuxPaneGeometry[],
@@ -2409,16 +2435,17 @@ export function planTmuxGridRebalance(
   if (!(region.width > 0) || !(region.height > 0)) return [];
   if (!(parent.width > 0)) return [];
 
-  // Unmanaged panes inside the group region (user splits) — leave the layout
-  // alone. Panes outside the region are not ours to care about.
+  // A foreign pane right of the parent inside the region (a user split in
+  // the grid area) would get wrecked by the rebalance — bail. Foreign panes
+  // elsewhere are not ours to care about.
   const trackedSet = new Set(tracked);
   const parentRight = parent.left + parent.width;
-  const isUnmanagedInRegion = (pane: TmuxPaneGeometry): boolean =>
+  const isForeignInRegion = (pane: TmuxPaneGeometry): boolean =>
     pane.paneId !== parentPaneId &&
     !trackedSet.has(pane.paneId) &&
     tmuxPaneInRegion(pane, region) &&
     pane.left >= parentRight - 1;
-  if (panes.some(isUnmanagedInRegion)) return [];
+  if (panes.some(isForeignInRegion)) return [];
   const targets = planGridTargets(tracked, region, parentRatio);
   if (!targets) return [];
 
@@ -2483,6 +2510,10 @@ function rebalanceTmuxGridLayout(parentPaneId: string): void {
   }
 }
 
+/**
+ * Rebalance the tmux window in the configured layout mode (tiled grid or
+ * equal-width columns). Best effort — never blocks spawning.
+ */
 function rebalanceTmuxLayoutForMode(parentPaneId: string): void {
   if (getSubagentLayoutMode() === "tiled") {
     rebalanceTmuxGridLayout(parentPaneId);
@@ -2494,7 +2525,7 @@ function rebalanceTmuxLayoutForMode(parentPaneId: string): void {
 /**
  * Create a tmux subagent surface. The group (parent + tracked subagent
  * panes) only ever claims the parent's own panel: when the window is shared
- * with unrelated panes, splits and rebalancing stay inside the group region.
+ * with foreign panes, splits and rebalancing stay inside the group region.
  * In "columns" mode (default) the first subagent splits the parent and new
  * subagents split the rightmost tracked subagent pane; rebalancing keeps the
  * parent at `PI_SUBAGENT_TMUX_PARENT_RATIO` (default 0.4) of the group
@@ -2575,7 +2606,7 @@ function isHerdrAgentWorking(surface: string): Promise<boolean> {
  * keeping the parent pane at a fixed share of the group region, then
  * rebalances so all subagent panes are equally wide
  * (`PI_SUBAGENT_HERDR_PARENT_RATIO`, default 0.4). When the tab is shared
- * with unrelated panes (another agent, user panes), the group only claims
+ * with foreign panes (another agent, user splits), the group only claims
  * the parent's own panel — foreign panes are never split or resized. In
  * "tiled" mode both herdr and tmux instead fill a grid right of the parent —
  * see createHerdrSubagentSurface / createTmuxSubagentSurface.

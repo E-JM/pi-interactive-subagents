@@ -4062,7 +4062,7 @@ describe("cmux.ts", () => {
       assert.ok(Math.abs(widths.get(C1)! - 0.6 * 134) < 1.5);
     });
 
-    it("shared tab: untracked pane right of the parent is not a cell", () => {
+    it("shared tab: a foreign pane right of the parent is not a cell", () => {
       // Without tracking, a foreign pane right of the parent used to be
       // treated as a subagent column and split/resized. Now cells are
       // tracked-only, so nothing balances and nothing is touched.
@@ -4178,7 +4178,8 @@ describe("cmux.ts", () => {
         { paneId: "partial", left: 150, width: 50, height: 30 },
       ]);
       // The partial-height tracked pane is not a column cell, so C1 absorbs
-      // the remaining width; untracked panes inside the region bail instead.
+      // the remaining width; a foreign pane inside the region would bail
+      // instead (absolute widths could not leave room for it).
       const ops = planTmuxRebalance(panes, PARENT, 0.4);
       assert.deepEqual(ops, [
         { paneId: PARENT, width: 80 },
@@ -4186,7 +4187,7 @@ describe("cmux.ts", () => {
       ]);
     });
 
-    it("bails when an untracked pane sits inside the region", () => {
+    it("bails when a foreign pane sits inside the region", () => {
       // A user-made pane inside the group region: absolute-width resizes
       // cannot leave room for it, so nothing is balanced.
       setTmuxSubagentPaneList([C1]);
@@ -4685,14 +4686,14 @@ describe("tiled grid layout", () => {
       assert.ok(Math.abs(ops[0].amount - 0.1) < 1e-9);
     });
 
-    it("freezes untracked panes and returns no ops for an empty grid", () => {
+    it("freezes foreign panes and returns no ops for an empty grid", () => {
       const layout = quadrantLayout(0.5);
       assert.equal(planHerdrGridRebalance(layout, PARENT, [], 0.4).length, 0);
     });
 
     it("shared tab: grid ops stay inside the group region", () => {
       // Two agents share the tab: foreign pane [0..134], group grid packed
-      // into the parent's own panel [134..268]. The root split (foreign |.
+      // into the parent's own panel [134..268]. The root split (foreign |
       // group) is outside the region and must never be walked.
       const layout = makeGridLayout(
         [
@@ -4848,7 +4849,7 @@ describe("tiled grid layout", () => {
       ]);
     });
 
-    it("bails when an unmanaged pane sits inside the region", () => {
+    it("bails when a foreign pane sits inside the grid area", () => {
       // A user-made pane inside the group region — resizing around it would
       // wreck the layout, so no ops are emitted.
       const panes = makePanes2D(240, 50, [
