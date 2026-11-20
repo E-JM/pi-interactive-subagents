@@ -3951,6 +3951,46 @@ describe("cmux.ts", () => {
       assert.equal(ops.length, 0);
     });
 
+    it("keeps a user-split tracked pane frozen when balancing the rest", () => {
+      // A tracked pane the user later split below full height is no longer a
+      // column cell: its current width feeds the frozen share (and the
+      // divider targets) instead of being re-balanced. parent 80 = 0.4 of
+      // the 200-wide group region, C1 70 is the only cell, C2 (user-split,
+      // 50) + its log pane (50) are frozen: C1's target is 200−80−100 = 20.
+      setHerdrSubagentPaneList([C1, C2]);
+      const layout = makeLayout(
+        400,
+        [
+          { pane_id: PARENT, x: 0, width: 80 },
+          { pane_id: C1, x: 80, width: 70 },
+          { pane_id: C2, x: 150, width: 50, height: 30 },
+          { pane_id: "w1:log", x: 150, y: 30, width: 50, height: 20 },
+        ],
+        [
+          {
+            id: "s0",
+            direction: "right",
+            ratio: 0.4,
+            rect: { x: 0, y: 0, width: 200, height: 50 },
+          },
+          {
+            id: "s1",
+            direction: "right",
+            ratio: 70 / 120,
+            rect: { x: 80, y: 0, width: 120, height: 50 },
+          },
+        ],
+      );
+      const ops = planHerdrRebalance(layout!, PARENT, 0.4);
+      // Only s1 moves: its low side (C1) must shrink 70 -> 20 of the 120-wide
+      // split, anchored on C2 (flush against the divider). s0 is already at
+      // its 0.4 ratio, so the parent keeps its width.
+      assert.equal(ops.length, 1);
+      assert.equal(ops[0].paneId, C2);
+      assert.equal(ops[0].direction, "left");
+      assert.ok(Math.abs(ops[0].amount - (70 / 120 - 1 / 6)) < 1e-9);
+    });
+
     it("bails out when balanced cells cannot fit", () => {
       // Parent 300 + a frozen stacked pane of 236 columns leaves nothing to
       // balance into (remaining = 400 - 160 - 236 = 4).
@@ -4561,6 +4601,17 @@ describe("tiled grid layout", () => {
         ),
         null,
       );
+    });
+
+    it("returns null when the down split would leave a too-short half", () => {
+      // 3 spawns in a 2×2 grid: the target cell is the bottom-left. A low
+      // pane (10 tall, y18..28) overlaps it more with its bottom half, so
+      // "down" wins the direction vote — but halving it leaves a 5-tall
+      // half, below the usable minimum, so the spawn falls back to columns.
+      const placed = [
+        { paneId: "%1", rect: { x: 80, y: 18, width: 120, height: 10 } },
+      ];
+      assert.equal(selectTiledGridAnchor(placed, REGION, 3), null);
     });
 
     it("splits the lone full pane right for subagent 2", () => {
