@@ -1891,7 +1891,7 @@ function subagentArea(group: GridRect, parentRight: number): GridRect {
 }
 
 /** Subagent area for herdr: right of the parent, inside the group region. */
-function herdrSubagentRegion(
+function herdrSubagentArea(
   layout: HerdrLayout,
   parent: HerdrLayoutPane,
 ): HerdrRect {
@@ -2068,7 +2068,7 @@ function createHerdrSubagentSurface(name: string): string {
         const selection = tiled
           ? selectTiledGridAnchor(
               placed,
-              herdrSubagentRegion(layout, parent),
+              herdrSubagentArea(layout, parent),
               tracked.length + 1,
             )
           : null;
@@ -2221,7 +2221,7 @@ function tmuxGroupRegion(
 }
 
 /** Subagent area for tmux: right of the parent, inside the group region. */
-function tmuxSubagentRegion(
+function tmuxSubagentArea(
   panes: TmuxPaneGeometry[],
   parent: TmuxPaneGeometry,
 ): GridRect {
@@ -2559,9 +2559,9 @@ function createTmuxSubagentSurface(name: string): string {
         );
         // Subagent area: right of the parent, clipped to the group region so
         // a shared-tab spawn never lands in a foreign pane.
-        const region = tmuxSubagentRegion(panes, parent);
+        const area = tmuxSubagentArea(panes, parent);
         const selection = tiled
-          ? selectTiledGridAnchor(placed, region, tracked.length + 1)
+          ? selectTiledGridAnchor(placed, area, tracked.length + 1)
           : null;
         if (selection) {
           anchorPaneId = selection.anchorPaneId;
