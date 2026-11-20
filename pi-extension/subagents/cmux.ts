@@ -1317,20 +1317,37 @@ function paneInRect(pane: HerdrLayoutPane, rect: HerdrRect): boolean {
   );
 }
 
+/**
+ * Shared guard for the herdr rebalance planners: sane layout dimensions and a
+ * full-height parent pane (within tolerance — true for the single-row column
+ * layout and the left parent grid strip alike). Returns the pieces both
+ * planners start from, or null when rebalancing must be skipped.
+ */
+function herdrBalancePreflight(
+  layout: HerdrLayout,
+  parentPaneId: string,
+): { total: HerdrRect; parent: HerdrLayoutPane } | null {
+  const total = layout.area;
+  if (!(total.width > 0) || !(total.height > 0)) return null;
+
+  const parent = layout.panes.find((pane) => pane.pane_id === parentPaneId);
+  if (!parent) return null;
+  // Balancing assumes a full-height parent in a single-row layout.
+  if (parent.rect.height < total.height - 2 || parent.rect.y > total.y + 2)
+    return null;
+
+  return { total, parent };
+}
+
 export function planHerdrRebalance(
   layout: HerdrLayout,
   parentPaneId: string,
   parentRatio: number,
 ): HerdrResizeOp[] {
+  const pre = herdrBalancePreflight(layout, parentPaneId);
+  if (!pre) return [];
+  const { total, parent } = pre;
   const ops: HerdrResizeOp[] = [];
-  const total = layout.area;
-  if (!(total.width > 0) || !(total.height > 0)) return ops;
-
-  const parent = layout.panes.find((pane) => pane.pane_id === parentPaneId);
-  if (!parent) return ops;
-  // Balancing assumes a full-height parent in a single-row layout.
-  if (parent.rect.height < total.height - 2 || parent.rect.y > total.y + 2)
-    return ops;
 
   // Column cells: full-height panes starting at/after the parent's right edge.
   const parentRight = parent.rect.x + parent.rect.width;
@@ -1580,15 +1597,10 @@ export function planHerdrGridRebalance(
   trackedPaneIds: string[],
   parentRatio: number,
 ): HerdrResizeOp[] {
+  const pre = herdrBalancePreflight(layout, parentPaneId);
+  if (!pre) return [];
+  const { total, parent } = pre;
   const ops: HerdrResizeOp[] = [];
-  const total = layout.area;
-  if (!(total.width > 0) || !(total.height > 0)) return ops;
-
-  const parent = layout.panes.find((pane) => pane.pane_id === parentPaneId);
-  if (!parent) return ops;
-  // Balancing assumes a full-height parent strip on the left.
-  if (parent.rect.height < total.height - 2 || parent.rect.y > total.y + 2)
-    return ops;
 
   const tracked = trackedPaneIds.filter((id) =>
     layout.panes.some((pane) => pane.pane_id === id),

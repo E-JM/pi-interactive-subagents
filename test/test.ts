@@ -1633,7 +1633,10 @@ describe("subagent-done.ts", () => {
     });
 
     it("exits when the turn produced no assistant message", () => {
-      assert.equal(shouldAutoExitOnAgentEnd([{ role: "user", content: [] }]), true);
+      assert.equal(
+        shouldAutoExitOnAgentEnd([{ role: "user", content: [] }]),
+        true,
+      );
       assert.equal(shouldAutoExitOnAgentEnd(undefined), true);
     });
 
@@ -1803,14 +1806,23 @@ describe("subagent-done.ts extension bootstrap", () => {
       const mock = bootstrap({ PI_SUBAGENT_NAME: "worker" });
       const { ctx, setWidgetCalls } = makeCtx(dir);
       mock.emit("session_start", {}, ctx);
-      const collapsed = setWidgetCalls[0].factory(null, theme).render(60).join("\n");
+      const collapsed = setWidgetCalls[0]
+        .factory(null, theme)
+        .render(60)
+        .join("\n");
       assert.match(collapsed, /Ctrl\+J to expand/);
       mock.registeredShortcuts[0].handler(ctx);
-      const expanded = setWidgetCalls[1].factory(null, theme).render(60).join("\n");
+      const expanded = setWidgetCalls[1]
+        .factory(null, theme)
+        .render(60)
+        .join("\n");
       assert.match(expanded, /Ctrl\+J to collapse/);
       assert.match(expanded, /0 available/);
       mock.registeredShortcuts[0].handler(ctx);
-      assert.match(setWidgetCalls[2].factory(null, theme).render(60).join("\n"), /Ctrl\+J to expand/);
+      assert.match(
+        setWidgetCalls[2].factory(null, theme).render(60).join("\n"),
+        /Ctrl\+J to expand/,
+      );
     });
   });
 
@@ -1820,11 +1832,17 @@ describe("subagent-done.ts extension bootstrap", () => {
       mock.api.getAllTools = () => [{ name: "read" }, { name: "write" }];
       const { ctx, setWidgetCalls } = makeCtx(dir);
       mock.emit("session_start", {}, ctx);
-      const collapsed = setWidgetCalls[0].factory(null, theme).render(60).join("\n");
+      const collapsed = setWidgetCalls[0]
+        .factory(null, theme)
+        .render(60)
+        .join("\n");
       assert.match(collapsed, /2 tools/);
       assert.match(collapsed, /2 denied/);
       mock.registeredShortcuts[0].handler(ctx);
-      const expanded = setWidgetCalls[1].factory(null, theme).render(60).join("\n");
+      const expanded = setWidgetCalls[1]
+        .factory(null, theme)
+        .render(60)
+        .join("\n");
       assert.match(expanded, /read/);
       assert.match(expanded, /denied: write, edit/);
     });
@@ -1848,11 +1866,18 @@ describe("subagent-done.ts extension bootstrap", () => {
       mock.emit("message_update", { assistantMessageEvent: { type: "text" } });
       mock.emit("tool_execution_start", { toolCallId: "t1", toolName: "read" });
       mock.emit("tool_call", { toolCallId: "t1", toolName: "read" });
-      mock.emit("tool_execution_update", { toolCallId: "t1", toolName: "read" });
+      mock.emit("tool_execution_update", {
+        toolCallId: "t1",
+        toolName: "read",
+      });
       mock.emit("tool_result", { toolCallId: "t1", toolName: "read" });
       mock.emit("tool_execution_end", { toolCallId: "t1", toolName: "read" });
       mock.emit("turn_end", { turnIndex: 0 });
-      mock.emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] }, ctx);
+      mock.emit(
+        "agent_end",
+        { messages: [{ role: "assistant", stopReason: "stop" }] },
+        ctx,
+      );
       mock.emit("session_shutdown");
       const activity = readSubagentActivityFile(activityFile);
       assert.ok(activity, "activity file was written");
@@ -1933,7 +1958,11 @@ describe("subagent-done.ts extension bootstrap", () => {
     withTempDir((dir) => {
       const mock = bootstrap({ PI_SUBAGENT_AUTO_EXIT: "1" });
       const { ctx, shutdowns } = makeCtx(dir);
-      process.env.PI_SUBAGENT_SESSION = join(dir, "missing-dir", "session.jsonl");
+      process.env.PI_SUBAGENT_SESSION = join(
+        dir,
+        "missing-dir",
+        "session.jsonl",
+      );
       mock.emit(
         "agent_end",
         {
@@ -1947,7 +1976,11 @@ describe("subagent-done.ts extension bootstrap", () => {
         },
         ctx,
       );
-      assert.equal(shutdowns(), 1, "shutdown must not be blocked by a failed sidecar write");
+      assert.equal(
+        shutdowns(),
+        1,
+        "shutdown must not be blocked by a failed sidecar write",
+      );
     });
   });
 

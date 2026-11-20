@@ -14,6 +14,7 @@ import type {
   ExtensionAPI,
   ExtensionContext,
   ExtensionUIContext,
+  Theme,
 } from "@mariozechner/pi-coding-agent";
 import {
   DynamicBorder,
@@ -618,6 +619,44 @@ function resultLabelWaiting(name: string, elapsedText: string): string {
 
 function resultLabelProviderError(name: string, elapsedText: string): string {
   return `Sub-agent "${name}" failed after ${elapsedText} (provider/agent error — auto-retry exhausted).`;
+}
+
+/** "▸ <target> — <action>" call header shared by the target-taking tools. */
+function renderTargetCall(
+  args: { id?: string; name?: string },
+  theme: Theme,
+  action: string,
+) {
+  const target = args.id ? `${args.id}` : (args.name ?? "(unknown)");
+  return new Text(
+    theme.fg("accent", "▸") +
+      " " +
+      theme.fg("toolTitle", theme.bold(target)) +
+      theme.fg("dim", ` — ${action}`),
+    0,
+    0,
+  );
+}
+
+/** Dim text fallback when a tool result carries no presentable details. */
+function renderResultFallback(
+  result: { content: Array<{ text?: unknown }> },
+  theme: Theme,
+) {
+  const text =
+    typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+  return new Text(theme.fg("dim", text as string), 0, 0);
+}
+
+/** Message-renderer tail: content lines in a padded, backgrounded box with a blank separator line. */
+function renderBoxLines(
+  contentLines: string[],
+  bgFn: (text: string) => string,
+  width: number,
+): string[] {
+  const box = new Box(1, 1, bgFn);
+  box.addChild(new Text(contentLines.join("\n"), 0, 0));
+  return ["", ...box.render(width)];
 }
 
 function resolveResultPresentation(
@@ -2406,11 +2445,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Fallback (shouldn't happen)
-        const text =
-          typeof result.content[0]?.text === "string"
-            ? result.content[0].text
-            : "";
-        return new Text(theme.fg("dim", text), 0, 0);
+        return renderResultFallback(result, theme);
       },
     });
 
@@ -2434,15 +2469,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
 
       renderCall(args, theme) {
-        const target = args.id ? `${args.id}` : (args.name ?? "(unknown)");
-        return new Text(
-          theme.fg("accent", "▸") +
-            " " +
-            theme.fg("toolTitle", theme.bold(target)) +
-            theme.fg("dim", " — interrupt turn"),
-          0,
-          0,
-        );
+        return renderTargetCall(args, theme, "interrupt turn");
       },
 
       renderResult(result, _opts, theme) {
@@ -2461,11 +2488,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           );
         }
 
-        const text =
-          typeof result.content[0]?.text === "string"
-            ? result.content[0].text
-            : "";
-        return new Text(theme.fg("dim", text), 0, 0);
+        return renderResultFallback(result, theme);
       },
     });
 
@@ -2597,11 +2620,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Fallback
-        const text =
-          typeof result.content[0]?.text === "string"
-            ? result.content[0].text
-            : "";
-        return new Text(theme.fg("dim", text), 0, 0);
+        return renderResultFallback(result, theme);
       },
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -2856,15 +2875,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
 
       renderCall(args, theme) {
-        const target = args.id ? `${args.id}` : (args.name ?? "(unknown)");
-        return new Text(
-          theme.fg("accent", "▸") +
-            " " +
-            theme.fg("toolTitle", theme.bold(target)) +
-            theme.fg("dim", " — close"),
-          0,
-          0,
-        );
+        return renderTargetCall(args, theme, "close");
       },
 
       renderResult(result, _opts, theme) {
@@ -2883,11 +2894,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           );
         }
 
-        const text =
-          typeof result.content[0]?.text === "string"
-            ? result.content[0].text
-            : "";
-        return new Text(theme.fg("dim", text), 0, 0);
+        return renderResultFallback(result, theme);
       },
     });
 
@@ -3052,9 +3059,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Render via Box for background + padding, with blank line above for separation
-        const box = new Box(1, 1, bgFn);
-        box.addChild(new Text(contentLines.join("\n"), 0, 0));
-        return ["", ...box.render(width)];
+        return renderBoxLines(contentLines, bgFn, width);
       },
     };
   });
@@ -3085,11 +3090,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           );
         }
 
-        const box = new Box(1, 1, (text: string) =>
-          theme.bg("customMessageBg", text),
+        return renderBoxLines(
+          contentLines,
+          (text: string) => theme.bg("customMessageBg", text),
+          width,
         );
-        box.addChild(new Text(contentLines.join("\n"), 0, 0));
-        return ["", ...box.render(width)];
       },
     };
   });
@@ -3130,9 +3135,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           );
         }
 
-        const box = new Box(1, 1, bgFn);
-        box.addChild(new Text(contentLines.join("\n"), 0, 0));
-        return ["", ...box.render(width)];
+        return renderBoxLines(contentLines, bgFn, width);
       },
     };
   });
