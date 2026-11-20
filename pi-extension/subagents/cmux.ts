@@ -1229,9 +1229,11 @@ interface PlacedPane {
 
 /**
  * Rects of the tracked panes present in `panes`, in tracked (fill) order;
- * tracked panes missing from `panes` are skipped.
+ * tracked panes missing from `panes` are skipped. The single input shaper
+ * for spawn-anchor selection in both backends — skipping keeps a stale
+ * /reload pane list from wedging the spawn. Exported for tests.
  */
-function placedPanes<Pane>(
+export function placedPanes<Pane>(
   trackedPaneIds: string[],
   panes: readonly Pane[],
   paneIdOf: (pane: Pane) => string,
@@ -1264,6 +1266,28 @@ export function rightmostAnchor(
     .sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x)
     .pop();
   return anchor?.paneId ?? null;
+}
+
+/**
+ * Resolve which pane a new subagent splits, and how: in tiled mode the pane
+ * covering the next grid cell (selectTiledGridAnchor over the subagent
+ * `area`), in columns mode the rightmost tracked pane (rightmostAnchor) with
+ * a plain right split. Null means nothing qualifies — the caller splits the
+ * parent itself rather than carving up a foreign pane. Exported for tests.
+ */
+export function selectSpawnAnchor(
+  placed: PlacedPane[],
+  area: GridRect,
+  parentRight: number,
+  tiled: boolean,
+  count: number,
+): TiledAnchorSelection | null {
+  const tiledSelection = tiled
+    ? selectTiledGridAnchor(placed, area, count)
+    : null;
+  if (tiledSelection) return tiledSelection;
+  const anchor = rightmostAnchor(placed, parentRight);
+  return anchor ? { anchorPaneId: anchor, direction: "right" } : null;
 }
 
 export interface TiledAnchorSelection {
@@ -2067,26 +2091,19 @@ function createHerdrSubagentSurface(name: string): string {
           (pane) => pane.pane_id,
           (pane) => pane.rect,
         );
-        const selection = tiled
-          ? selectTiledGridAnchor(
-              placed,
-              herdrSubagentArea(layout, parent),
-              tracked.length + 1,
-            )
-          : null;
+        // Tiled: the pane covering the next grid cell. Columns (or tiled
+        // fallback): the rightmost tracked pane. Null: split the parent —
+        // never a foreign pane.
+        const selection = selectSpawnAnchor(
+          placed,
+          herdrSubagentArea(layout, parent),
+          parent.rect.x + parent.rect.width,
+          tiled,
+          tracked.length + 1,
+        );
         if (selection) {
           anchorPaneId = selection.anchorPaneId;
           splitDirection = selection.direction;
-        } else {
-          // Columns mode, or tiled fallback: split the rightmost tracked pane
-          // (the pane list survives /reload). No tracked pane yet — first
-          // spawn, or a fresh process whose pane list is gone — leaves the
-          // anchor at the parent rather than carving up a foreign pane.
-          const anchor = rightmostAnchor(
-            placed,
-            parent.rect.x + parent.rect.width,
-          );
-          if (anchor) anchorPaneId = anchor;
         }
       }
     }
@@ -2560,21 +2577,19 @@ function createTmuxSubagentSurface(name: string): string {
           tmuxPaneRect,
         );
         // Subagent area: right of the parent, clipped to the group region so
-        // a shared-tab spawn never lands in a foreign pane.
-        const area = tmuxSubagentArea(panes, parent);
-        const selection = tiled
-          ? selectTiledGridAnchor(placed, area, tracked.length + 1)
-          : null;
+        // a shared-tab spawn never lands in a foreign pane. Tiled picks the
+        // pane covering the next grid cell, columns the rightmost tracked
+        // pane; null splits the parent.
+        const selection = selectSpawnAnchor(
+          placed,
+          tmuxSubagentArea(panes, parent),
+          parent.left + parent.width,
+          tiled,
+          tracked.length + 1,
+        );
         if (selection) {
           anchorPaneId = selection.anchorPaneId;
           splitDirection = selection.direction;
-        } else {
-          // Columns mode, or tiled fallback: split the rightmost tracked pane
-          // (the pane list survives /reload). No tracked pane yet — first
-          // spawn, or a fresh process whose pane list is gone — leaves the
-          // anchor at the parent rather than carving up a foreign pane.
-          const anchor = rightmostAnchor(placed, parent.left + parent.width);
-          if (anchor) anchorPaneId = anchor;
         }
       }
     }

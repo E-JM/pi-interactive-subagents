@@ -34,6 +34,7 @@ import {
   parseHerdrLayout,
   parseHerdrPaneId,
   parseTmuxPaneGeometry,
+  placedPanes,
   planGridTargets,
   planHerdrGridRebalance,
   planHerdrRebalance,
@@ -42,6 +43,7 @@ import {
   rightmostAnchor,
   predictZellijSplitDirection,
   selectTiledGridAnchor,
+  selectSpawnAnchor,
   selectZellijPlacement,
   selectZellijStackPlacement,
   setHerdrSubagentPaneList,
@@ -4275,6 +4277,93 @@ describe("cmux.ts rightmostAnchor", () => {
 
   it("returns null when nothing is placed", () => {
     assert.equal(rightmostAnchor([], 67), null);
+  });
+});
+
+describe("cmux.ts placedPanes", () => {
+  const panes = [
+    { id: "%1", x: 80, y: 0 },
+    { id: "%2", x: 140, y: 25 },
+    { id: "%3", x: 80, y: 25 },
+  ];
+  const rectOf = (pane: { x: number; y: number }) => ({
+    x: pane.x,
+    y: pane.y,
+    width: 60,
+    height: 25,
+  });
+
+  it("returns tracked panes with rects in tracked (fill) order", () => {
+    assert.deepEqual(
+      placedPanes(["%3", "%1"], panes, (pane) => pane.id, rectOf),
+      [
+        { paneId: "%3", rect: rectOf(panes[2]) },
+        { paneId: "%1", rect: rectOf(panes[0]) },
+      ],
+    );
+  });
+
+  it("skips tracked panes missing from the layout (stale /reload list)", () => {
+    assert.deepEqual(
+      placedPanes(["%2", "%9"], panes, (pane) => pane.id, rectOf),
+      [{ paneId: "%2", rect: rectOf(panes[1]) }],
+    );
+  });
+
+  it("returns empty when nothing tracked is placed", () => {
+    assert.deepEqual(
+      placedPanes([], panes, (pane) => pane.id, rectOf),
+      [],
+    );
+  });
+});
+
+describe("cmux.ts selectSpawnAnchor", () => {
+  // Region right of a 0.4 parent: x 80..200, full height.
+  const AREA = { x: 80, y: 0, width: 120, height: 50 };
+  const column = (x: number, y = 0) => ({ x, y, width: 60, height: 50 });
+
+  it("columns mode: splits the rightmost tracked pane (direction right)", () => {
+    const placed = [
+      { paneId: "%1", rect: column(80) },
+      { paneId: "%2", rect: column(140) },
+    ];
+    assert.deepEqual(selectSpawnAnchor(placed, AREA, 80, false, 3), {
+      anchorPaneId: "%2",
+      direction: "right",
+    });
+  });
+
+  it("columns mode with no tracked pane: null — caller splits the parent", () => {
+    assert.equal(selectSpawnAnchor([], AREA, 80, false, 1), null);
+  });
+
+  it("tiled mode: picks the pane covering the next grid cell", () => {
+    const placed = [{ paneId: "%1", rect: column(80) }];
+    assert.deepEqual(selectSpawnAnchor(placed, AREA, 80, true, 3), {
+      anchorPaneId: "%1",
+      direction: "down",
+    });
+  });
+
+  it("tiled fallback: rightmost tracked pane when tiling is impossible", () => {
+    // Region too small for the 3-pane grid — falls back to the columns
+    // anchor instead of forcing a cramped split.
+    const placed = [{ paneId: "%1", rect: column(80) }];
+    assert.deepEqual(
+      selectSpawnAnchor(
+        placed,
+        { x: 80, y: 0, width: 30, height: 50 },
+        80,
+        true,
+        3,
+      ),
+      { anchorPaneId: "%1", direction: "right" },
+    );
+  });
+
+  it("tiled fallback with nothing tracked: null — caller splits the parent", () => {
+    assert.equal(selectSpawnAnchor([], AREA, 80, true, 1), null);
   });
 });
 
