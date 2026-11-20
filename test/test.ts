@@ -39,6 +39,7 @@ import {
   planHerdrRebalance,
   planTmuxGridRebalance,
   planTmuxRebalance,
+  rightmostAnchor,
   predictZellijSplitDirection,
   selectTiledGridAnchor,
   selectZellijPlacement,
@@ -4231,6 +4232,48 @@ describe("cmux.ts", () => {
       const panes = makePanes(200, [{ paneId: C1, left: 0, width: 200 }]);
       assert.equal(planTmuxRebalance(panes, PARENT, 0.4).length, 0);
     });
+  });
+});
+
+describe("cmux.ts rightmostAnchor", () => {
+  // Full-height column-shaped panes of the columns-mode layout.
+  const rect = (x: number, y = 0) => ({ x, y, width: 67, height: 50 });
+
+  it("picks the rightmost tracked pane at or right of the parent's edge", () => {
+    const placed = [
+      { paneId: "%1", rect: rect(67) },
+      { paneId: "%2", rect: rect(134) },
+    ];
+    assert.equal(rightmostAnchor(placed, 67), "%2");
+  });
+
+  it("prefers the bottommost pane, then the rightmost, on ties", () => {
+    // Columns-mode panes are full-height (same y), so the y tie-break only
+    // decides odd layouts: the anchor is max y, then max x.
+    const placed = [
+      { paneId: "%1", rect: rect(67, 0) },
+      { paneId: "%2", rect: rect(134, 25) },
+      { paneId: "%3", rect: rect(134, 0) },
+    ];
+    assert.equal(rightmostAnchor(placed, 67), "%2");
+  });
+
+  it("ignores tracked panes left of the parent's right edge", () => {
+    const placed = [
+      { paneId: "%1", rect: rect(0) },
+      { paneId: "%2", rect: rect(67) },
+    ];
+    assert.equal(rightmostAnchor(placed, 67), "%2");
+    assert.equal(rightmostAnchor([{ paneId: "%1", rect: rect(0) }], 67), null);
+  });
+
+  it("accepts a pane flush against the parent within 1 cell", () => {
+    assert.equal(rightmostAnchor([{ paneId: "%1", rect: rect(66) }], 67), "%1");
+    assert.equal(rightmostAnchor([{ paneId: "%1", rect: rect(65) }], 67), null);
+  });
+
+  it("returns null when nothing is placed", () => {
+    assert.equal(rightmostAnchor([], 67), null);
   });
 });
 
