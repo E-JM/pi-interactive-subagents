@@ -1357,20 +1357,36 @@ export interface HerdrResizeOp {
 }
 
 /**
- * True when `pane` lies (within a ±1.5 cell tolerance for float drift) fully
- * inside `rect`. Shared by the columns and grid rebalance planners.
+ * Slack (cells) for herdr containment checks: herdr rect coordinates are
+ * ratio-derived floats, so edges can drift off an integer cell grid.
+ */
+const HERDR_RECT_TOLERANCE = 1.5;
+
+/**
+ * True when a layout pane lies fully inside `rect` within herdr's
+ * float-drift tolerance. The herdr pane adapter over rectWithin, shared by
+ * the columns and grid rebalance planners.
  */
 function paneInRect(pane: HerdrLayoutPane, rect: HerdrRect): boolean {
-  return rectWithin(pane.rect, rect);
+  return rectWithin(pane.rect, rect, HERDR_RECT_TOLERANCE);
 }
 
-/** Containment check for a raw rect against `rect`, with paneInRect's tolerance. */
-function rectWithin(rect: HerdrRect, bounds: HerdrRect): boolean {
+/**
+ * True when `rect` lies fully inside `bounds` within a ±`tolerance`-cell
+ * slack. The one containment primitive behind both backends' region checks:
+ * herdr passes HERDR_RECT_TOLERANCE (float drift), tmux passes
+ * TMUX_RECT_TOLERANCE (integer geometry).
+ */
+function rectWithin(
+  rect: HerdrRect,
+  bounds: HerdrRect,
+  tolerance: number,
+): boolean {
   return (
-    rect.x >= bounds.x - 1.5 &&
-    rect.y >= bounds.y - 1.5 &&
-    rect.x + rect.width <= bounds.x + bounds.width + 1.5 &&
-    rect.y + rect.height <= bounds.y + bounds.height + 1.5
+    rect.x >= bounds.x - tolerance &&
+    rect.y >= bounds.y - tolerance &&
+    rect.x + rect.width <= bounds.x + bounds.width + tolerance &&
+    rect.y + rect.height <= bounds.y + bounds.height + tolerance
   );
 }
 
@@ -1466,7 +1482,9 @@ function herdrColumnDividerOps(
 ): HerdrResizeOp[] {
   // Outermost splits first, restricted to the group's own split subtree.
   const rightSplits = layout.splits.filter(
-    (split) => split.direction === "right" && rectWithin(split.rect, region),
+    (split) =>
+      split.direction === "right" &&
+      rectWithin(split.rect, region, HERDR_RECT_TOLERANCE),
   );
   const splits = [...rightSplits].sort(
     (a, b) => b.rect.width * b.rect.height - a.rect.width * a.rect.height,
@@ -1741,10 +1759,10 @@ export function planHerdrGridRebalance(
 
   const byAreaDesc = (a: HerdrLayoutSplit, b: HerdrLayoutSplit): number =>
     b.rect.width * b.rect.height - a.rect.width * a.rect.height;
-  // Only the group's own split subtree: dividers shared with panes outside
-  // the region must never move.
+  // Only the group's own split subtree: dividers shared with foreign panes
+  // must never move.
   const inRegion = (split: HerdrLayoutSplit): boolean =>
-    rectWithin(split.rect, region);
+    rectWithin(split.rect, region, HERDR_RECT_TOLERANCE);
   const verticalDividers = layout.splits
     .filter((split) => split.direction === "right" && inRegion(split))
     .sort(byAreaDesc);
@@ -2183,14 +2201,18 @@ function tmuxSubagentRegion(
   );
 }
 
-/** Containment check for tmux pane geometry against a region rect. */
+/**
+ * Slack (window cells) for tmux containment checks: pane geometry is integer
+ * columns/rows, nudged by absolute resizes.
+ */
+const TMUX_RECT_TOLERANCE = 1;
+
+/**
+ * True when a pane lies fully inside `region` within tmux's integer-geometry
+ * tolerance — the tmux pane adapter over rectWithin.
+ */
 function tmuxPaneInRegion(pane: TmuxPaneGeometry, region: GridRect): boolean {
-  return (
-    pane.left >= region.x - 1 &&
-    pane.top >= region.y - 1 &&
-    pane.left + pane.width <= region.x + region.width + 1 &&
-    pane.top + pane.height <= region.y + region.height + 1
-  );
+  return rectWithin(tmuxPaneRect(pane), region, TMUX_RECT_TOLERANCE);
 }
 
 /**
