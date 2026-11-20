@@ -1488,9 +1488,10 @@ function herdrColumnTargets(
 
   const parentTarget = parentRatio * region.width;
   const remaining = region.width - parentTarget - frozenSum;
-  // cells is non-empty here (cellIds.size === 0 returned above), so every
-  // cell must keep a usable sliver after the split.
-  if (!(remaining > 5)) return null; // can't fit; leave the layout alone
+  // cells is non-empty here (cellIds.size === 0 returned above). If their
+  // combined share shrinks to a sliver, the layout cannot be balanced —
+  // leave it alone.
+  if (!(remaining > 5)) return null;
   const cellTarget = remaining / cells.length;
 
   return (pane: HerdrLayoutPane): number => {
