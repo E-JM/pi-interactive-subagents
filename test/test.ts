@@ -43,7 +43,9 @@ import {
   selectTiledGridAnchor,
   selectZellijPlacement,
   selectZellijStackPlacement,
+  setHerdrSubagentPaneList,
   setSubagentLayoutMode,
+  setTmuxSubagentPaneList,
   shellEscape,
 } from "../pi-extension/subagents/cmux.ts";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
@@ -3702,7 +3704,10 @@ describe("cmux.ts", () => {
       assert.equal(parseHerdrLayout(JSON.stringify({ result: {} })), null);
     });
 
-    it("grows the parent before the first subagent spawns", () => {
+    it("grows the parent into its region share after the first spawn", () => {
+      // Right after the first spawn the parent holds half the group region;
+      // rebalancing moves it to the configured 0.4 share.
+      setHerdrSubagentPaneList([C1]);
       const layout = makeLayout(
         393,
         [
@@ -3728,6 +3733,7 @@ describe("cmux.ts", () => {
     });
 
     it("balances an unbalanced inner divider via the left neighbor", () => {
+      setHerdrSubagentPaneList([C1, C2]);
       const layout = makeLayout(
         400,
         [
@@ -3760,6 +3766,7 @@ describe("cmux.ts", () => {
     });
 
     it("emits no ops when the layout is already balanced", () => {
+      setHerdrSubagentPaneList([C1, C2]);
       const layout = makeLayout(
         400,
         [
@@ -3792,6 +3799,14 @@ describe("cmux.ts", () => {
       // divider at x=157. Resizing p7 is ambiguous - herdr could move either
       // divider - so the planner must bail rather than guess and possibly
       // shrink the parent. New code never creates this shape.
+      setHerdrSubagentPaneList([
+        "w1:p5",
+        "w1:p6",
+        "w1:p7",
+        "w1:p2",
+        "w1:p3",
+        "w1:p4",
+      ]);
       const leaves = [
         { pane_id: PARENT, x: 0, width: 140 },
         { pane_id: "w1:p5", x: 140, width: 5 },
@@ -3852,6 +3867,7 @@ describe("cmux.ts", () => {
     it("balances a clean four-cell tree of nested splits", () => {
       // The shape this extension actually produces: root [parent | row] with
       // row cells nested right. Targets: parent 40%, four equal cells.
+      setHerdrSubagentPaneList([C1, C2, C3, "w1:p6"]);
       const leaves = [
         { pane_id: PARENT, x: 0, width: 98 },
         { pane_id: C1, x: 98, width: 98 },
@@ -3905,6 +3921,7 @@ describe("cmux.ts", () => {
     it("freezes panes that are not column cells (partial height)", () => {
       // A user-made stacked log pane below the first cell must keep its width
       // and its down-split untouched.
+      setHerdrSubagentPaneList([C1]);
       const layout = makeLayout(
         400,
         [
@@ -3934,6 +3951,7 @@ describe("cmux.ts", () => {
     it("bails out when balanced cells cannot fit", () => {
       // Parent 300 + a frozen stacked pane of 236 columns leaves nothing to
       // balance into (remaining = 400 - 160 - 236 = 4).
+      setHerdrSubagentPaneList([C1, C2]);
       const layout = makeLayout(
         400,
         [
@@ -3963,6 +3981,113 @@ describe("cmux.ts", () => {
 
     it("returns no ops when the parent pane is missing from the layout", () => {
       const layout = makeLayout(400, [{ pane_id: C1, x: 0, width: 400 }]);
+      const ops = planHerdrRebalance(layout!, PARENT, 0.4);
+      assert.equal(ops.length, 0);
+    });
+
+    it("shared tab, parent on the left: never touches the foreign pane", () => {
+      // Two agents share the tab: [parent 134][foreign 134]. After the first
+      // spawn the group region is just the parent's own panel — the foreign
+      // agent pane must keep its width.
+      setHerdrSubagentPaneList([C1]);
+      const layout = makeLayout(
+        268,
+        [
+          { pane_id: PARENT, x: 0, width: 67 },
+          { pane_id: C1, x: 67, width: 67 },
+          { pane_id: "w1:foreign", x: 134, width: 134 },
+        ],
+        [
+          {
+            id: "root",
+            direction: "right",
+            ratio: 0.5,
+            rect: { x: 0, y: 0, width: 268, height: 50 },
+          },
+          {
+            id: "inner",
+            direction: "right",
+            ratio: 0.5,
+            rect: { x: 0, y: 0, width: 134, height: 50 },
+          },
+        ],
+      );
+      const ops = planHerdrRebalance(layout!, PARENT, 0.4);
+      // One op inside the group's own split subtree: parent to 0.4 of 134.
+      assert.equal(ops.length, 1);
+      assert.equal(ops[0].paneId, C1);
+      assert.equal(ops[0].direction, "left");
+      assert.ok(Math.abs(ops[0].amount - (0.5 - 0.4)) < 1e-9);
+      const widths = simulateFinalWidths(layout!, ops);
+      assert.equal(widths.get("w1:foreign"), 134);
+      assert.ok(Math.abs(widths.get(PARENT)! - 0.4 * 134) < 1.5);
+      assert.ok(Math.abs(widths.get(C1)! - 0.6 * 134) < 1.5);
+    });
+
+    it("shared tab, parent on the right: never touches the foreign pane", () => {
+      setHerdrSubagentPaneList([C1]);
+      const layout = makeLayout(
+        268,
+        [
+          { pane_id: "w1:foreign", x: 0, width: 134 },
+          { pane_id: PARENT, x: 134, width: 67 },
+          { pane_id: C1, x: 201, width: 67 },
+        ],
+        [
+          {
+            id: "root",
+            direction: "right",
+            ratio: 0.5,
+            rect: { x: 0, y: 0, width: 268, height: 50 },
+          },
+          {
+            id: "inner",
+            direction: "right",
+            ratio: 0.5,
+            rect: { x: 134, y: 0, width: 134, height: 50 },
+          },
+        ],
+      );
+      const ops = planHerdrRebalance(layout!, PARENT, 0.4);
+      // The root divider (foreign pane | group) must not move — only the
+      // group's inner split is rebalanced.
+      assert.equal(ops.length, 1);
+      assert.equal(ops[0].paneId, C1);
+      assert.equal(ops[0].direction, "left");
+      assert.ok(Math.abs(ops[0].amount - (0.5 - 0.4)) < 1e-9);
+      const widths = simulateFinalWidths(layout!, ops);
+      assert.equal(widths.get("w1:foreign"), 134);
+      assert.ok(Math.abs(widths.get(PARENT)! - 0.4 * 134) < 1.5);
+      assert.ok(Math.abs(widths.get(C1)! - 0.6 * 134) < 1.5);
+    });
+
+    it("shared tab: untracked pane right of the parent is not a cell", () => {
+      // Without tracking, a foreign pane right of the parent used to be
+      // treated as a subagent column and split/resized. Now cells are
+      // tracked-only, so nothing balances and nothing is touched.
+      setHerdrSubagentPaneList([]);
+      const layout = makeLayout(
+        268,
+        [
+          { pane_id: PARENT, x: 0, width: 67 },
+          { pane_id: C1, x: 67, width: 67 },
+          { pane_id: "w1:foreign", x: 134, width: 134 },
+        ],
+        [
+          {
+            id: "root",
+            direction: "right",
+            ratio: 0.5,
+            rect: { x: 0, y: 0, width: 268, height: 50 },
+          },
+          {
+            id: "inner",
+            direction: "right",
+            ratio: 0.5,
+            rect: { x: 0, y: 0, width: 134, height: 50 },
+          },
+        ],
+      );
       const ops = planHerdrRebalance(layout!, PARENT, 0.4);
       assert.equal(ops.length, 0);
     });
@@ -4019,6 +4144,7 @@ describe("cmux.ts", () => {
     });
 
     it("plans parent and equal cell widths from absolute geometry", () => {
+      setTmuxSubagentPaneList([C1, C2]);
       const panes = makePanes(200, [
         { paneId: PARENT, left: 0, width: 100 },
         { paneId: C1, left: 100, width: 50 },
@@ -4033,6 +4159,7 @@ describe("cmux.ts", () => {
     });
 
     it("emits no ops when already balanced", () => {
+      setTmuxSubagentPaneList([C1, C2]);
       const panes = makePanes(200, [
         { paneId: PARENT, left: 0, width: 80 },
         { paneId: C1, left: 80, width: 60 },
@@ -4042,14 +4169,15 @@ describe("cmux.ts", () => {
       assert.equal(ops.length, 0);
     });
 
-    it("only balances full-height panes right of the parent", () => {
+    it("only balances tracked full-height panes right of the parent", () => {
+      setTmuxSubagentPaneList([C1, "partial"]);
       const panes = makePanes(200, [
         { paneId: PARENT, left: 0, width: 100 },
         { paneId: C1, left: 100, width: 50 },
-        { paneId: "lefty", left: 0, width: 100, height: 49 },
+        { paneId: "partial", left: 150, width: 50, height: 30 },
       ]);
-      // lefty starts at x=0 (left of parent's right edge) and is partial
-      // height — it is frozen, and only C1 becomes a balanced cell.
+      // The partial-height tracked pane is not a column cell, so C1 absorbs
+      // the remaining width; untracked panes inside the region bail instead.
       const ops = planTmuxRebalance(panes, PARENT, 0.4);
       assert.deepEqual(ops, [
         { paneId: PARENT, width: 80 },
@@ -4057,9 +4185,40 @@ describe("cmux.ts", () => {
       ]);
     });
 
+    it("bails when an untracked pane sits inside the region", () => {
+      // A user-made pane inside the group region: absolute-width resizes
+      // cannot leave room for it, so nothing is balanced.
+      setTmuxSubagentPaneList([C1]);
+      const panes = makePanes(200, [
+        { paneId: PARENT, left: 0, width: 100 },
+        { paneId: C1, left: 100, width: 50 },
+        { paneId: "lefty", left: 0, width: 100, height: 49 },
+      ]);
+      const ops = planTmuxRebalance(panes, PARENT, 0.4);
+      assert.equal(ops.length, 0);
+    });
+
+    it("shared tab: never touches the foreign pane", () => {
+      // Two agents share the window: [parent 67][sub 67][foreign 134]. The
+      // group region is the parent's own panel — the foreign pane keeps its
+      // width and the parent moves to 0.4 of the region.
+      setTmuxSubagentPaneList([C1]);
+      const panes = makePanes(268, [
+        { paneId: PARENT, left: 0, width: 67 },
+        { paneId: C1, left: 67, width: 67 },
+        { paneId: "%foreign", left: 134, width: 134 },
+      ]);
+      const ops = planTmuxRebalance(panes, PARENT, 0.4);
+      assert.deepEqual(ops, [
+        { paneId: PARENT, width: 54 },
+        { paneId: C1, width: 80 },
+      ]);
+    });
+
     it("bails out when cells cannot fit", () => {
       // Parent target 18 of 20 leaves 2 columns for two cells — fewer than
       // the two columns per cell the planner requires.
+      setTmuxSubagentPaneList([C1, C2]);
       const panes = makePanes(20, [
         { paneId: PARENT, left: 0, width: 18 },
         { paneId: C1, left: 18, width: 1 },
@@ -4349,9 +4508,10 @@ describe("tiled grid layout", () => {
         ratio: number;
         rect: { x: number; y: number; width: number; height: number };
       }>,
+      areaWidth = 200,
     ) {
       return {
-        area: { x: 0, y: 0, width: 200, height: 50 },
+        area: { x: 0, y: 0, width: areaWidth, height: 50 },
         panes,
         splits,
         tab_id: "w1:t1",
@@ -4486,6 +4646,70 @@ describe("tiled grid layout", () => {
       const layout = quadrantLayout(0.5);
       assert.equal(planHerdrGridRebalance(layout, PARENT, [], 0.4).length, 0);
     });
+
+    it("shared tab: grid ops stay inside the group region", () => {
+      // Two agents share the tab: foreign pane [0..134], group grid packed
+      // into the parent's own panel [134..268]. The root split (foreign |.
+      // group) is outside the region and must never be walked.
+      const layout = makeGridLayout(
+        [
+          {
+            pane_id: "w1:foreign",
+            rect: { x: 0, y: 0, width: 134, height: 50 },
+          },
+          { pane_id: PARENT, rect: { x: 134, y: 0, width: 54, height: 50 } },
+          { pane_id: "%1", rect: { x: 188, y: 0, width: 48, height: 25 } },
+          { pane_id: "%3", rect: { x: 188, y: 25, width: 48, height: 25 } },
+          { pane_id: "%2", rect: { x: 236, y: 0, width: 32, height: 25 } },
+          { pane_id: "%4", rect: { x: 236, y: 25, width: 32, height: 25 } },
+        ],
+        [
+          {
+            id: "root",
+            direction: "right",
+            ratio: 0.5,
+            rect: { x: 0, y: 0, width: 268, height: 50 },
+          },
+          {
+            id: "s0",
+            direction: "right",
+            ratio: 54 / 134,
+            rect: { x: 134, y: 0, width: 134, height: 50 },
+          },
+          {
+            id: "s1",
+            direction: "right",
+            ratio: 0.6,
+            rect: { x: 188, y: 0, width: 80, height: 50 },
+          },
+          {
+            id: "s2",
+            direction: "down",
+            ratio: 0.5,
+            rect: { x: 188, y: 0, width: 48, height: 50 },
+          },
+          {
+            id: "s3",
+            direction: "down",
+            ratio: 0.5,
+            rect: { x: 236, y: 0, width: 32, height: 50 },
+          },
+        ],
+        268,
+      );
+      const ops = planHerdrGridRebalance(
+        layout as any,
+        PARENT,
+        ["%1", "%2", "%3", "%4"],
+        0.4,
+      );
+      // Only the group's column divider moves; the root split (and with it
+      // the foreign pane) is untouched.
+      assert.equal(ops.length, 1);
+      assert.equal(ops[0].paneId, "%2");
+      assert.equal(ops[0].direction, "left");
+      assert.ok(Math.abs(ops[0].amount - 0.1) < 1e-9);
+    });
   });
 
   describe("planTmuxGridRebalance", () => {
@@ -4565,13 +4789,29 @@ describe("tiled grid layout", () => {
       assert.equal(ops.length, 0);
     });
 
-    it("bails when unmanaged panes occupy the subagent region", () => {
-      // A user-made pane sits right of the parent — resizing around it would
-      // wreck the layout, so no ops are emitted.
+    it("shared tab: rebalances inside the region and leaves foreign panes alone", () => {
+      // Two agents share the window: [parent 96][sub 72][foreign 72]. The
+      // foreign pane used to bail the whole rebalance; now the group only
+      // claims its own panel [0..168] and %9 is not ours to care about.
       const panes = makePanes2D(240, 50, [
         { paneId: PARENT, left: 0, width: 96 },
         { paneId: "%1", left: 96, width: 72 },
         { paneId: "%9", left: 168, width: 72 },
+      ]);
+      const ops = planTmuxGridRebalance(panes, PARENT, ["%1"], 0.4);
+      assert.deepEqual(ops, [
+        { paneId: PARENT, width: 67 },
+        { paneId: "%1", width: 101, height: undefined },
+      ]);
+    });
+
+    it("bails when an unmanaged pane sits inside the region", () => {
+      // A user-made pane inside the group region — resizing around it would
+      // wreck the layout, so no ops are emitted.
+      const panes = makePanes2D(240, 50, [
+        { paneId: PARENT, left: 0, width: 96 },
+        { paneId: "%9", left: 96, width: 20 },
+        { paneId: "%1", left: 116, width: 52 },
       ]);
       const ops = planTmuxGridRebalance(panes, PARENT, ["%1"], 0.4);
       assert.equal(ops.length, 0);

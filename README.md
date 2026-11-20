@@ -71,6 +71,8 @@ Two layouts control how subagent panes fill the space to the right of the main a
 
 Switch layouts with the **`/subagent-layout`** command: with no arguments it opens an interactive picker (current choice preselected, Esc cancels), or pass `columns` / `tiled` explicitly — both offer argument completion in the editor. The choice persists across restarts and applies to newly spawned subagents; existing panes keep their geometry until the next spawn or close. You can also set the default with the `PI_SUBAGENT_LAYOUT=columns|tiled` environment variable — a persisted `/subagent-layout` choice wins over the env var.
 
+**Shared tabs:** an agent group only claims its parent's own panel — the bounding region of the parent pane and its subagent panes. When the tab also holds unrelated panes (another agent, your own splits), subagents split inside that region and rebalancing never moves panes outside it, so a second agent keeps its pane size while the first one spawns. A solo parent's region is the whole tab, which behaves exactly as before.
+
 cmux, zellij, and WezTerm keep their own layout behavior regardless of this setting.
 
 ## What's Included
