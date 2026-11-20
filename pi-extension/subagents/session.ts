@@ -8,14 +8,14 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 
-export interface SessionEntry {
+interface SessionEntry {
   type: string;
   id: string;
   parentId?: string;
   [key: string]: unknown;
 }
 
-export interface MessageEntry extends SessionEntry {
+interface MessageEntry extends SessionEntry {
   type: "message";
   message: {
     role: "user" | "assistant" | "toolResult";
@@ -25,6 +25,15 @@ export interface MessageEntry extends SessionEntry {
 
 export type SeededSubagentSessionMode = "lineage-only" | "fork";
 
+/**
+ * History lines seeded into a forked child session.
+ *
+ * Two rules: (1) the seeded history is truncated BEFORE (excluding) the
+ * parent's most recent user message — the child must not see its own task
+ * twice, since the task is delivered separately as the child's first prompt;
+ * (2) prior `session` header lines are stripped because the child writes its
+ * own header (seedSubagentSessionFile prepends it).
+ */
 function getForkContentLines(parentSessionFile: string): string[] {
   const raw = readFileSync(parentSessionFile, "utf8");
   const lines = raw.split("\n").filter((line) => line.trim());
@@ -81,16 +90,15 @@ function readEntries(sessionFile: string): SessionEntry[] {
     .map((line) => JSON.parse(line) as SessionEntry);
 }
 
-/**
- * Return the id of the last entry in the session file (current branch point / leaf).
- */
+/** Return the id of the session file's last entry (the session leaf). */
 export function getLeafId(sessionFile: string): string | null {
   const entries = readEntries(sessionFile);
   return entries.length > 0 ? entries[entries.length - 1].id : null;
 }
 
 /**
- * Return entries added after `afterLine` (1-indexed count of existing entries).
+ * Return entries after skipping the first `afterLine` lines (a previously
+ * recorded entry count). `0` returns all entries.
  */
 export function getNewEntries(
   sessionFile: string,
@@ -109,6 +117,32 @@ export function getNewEntries(
  * auto-retry exhausts on a provider overload / rate limit / server error, and
  * without this fallback the parent would silently see a stale earlier message.
  */
+/** Non-empty text blocks of an assistant message, in order. */
+function assistantTexts(msg: MessageEntry): string[] {
+  return msg.message.content
+    .filter(
+      (block) =>
+        block.type === "text" &&
+        typeof block.text === "string" &&
+        block.text.trim() !== "",
+    )
+    .map((block) => block.text as string);
+}
+
+/** Error text when the assistant turn ended with a surfaced error. */
+function assistantErrorText(msg: MessageEntry): string | null {
+  const stopReason = (msg.message as { stopReason?: unknown }).stopReason;
+  const errorMessage = (msg.message as { errorMessage?: unknown }).errorMessage;
+  if (
+    stopReason === "error" &&
+    typeof errorMessage === "string" &&
+    errorMessage.trim() !== ""
+  ) {
+    return `Subagent error: ${errorMessage.trim()}`;
+  }
+  return null;
+}
+
 export function findLastAssistantMessage(
   entries: SessionEntry[],
 ): string | null {
@@ -118,29 +152,28 @@ export function findLastAssistantMessage(
     const msg = entry as MessageEntry;
     if (msg.message.role !== "assistant") continue;
 
-    const texts = msg.message.content
-      .filter(
-        (block) =>
-          block.type === "text" &&
-          typeof block.text === "string" &&
-          block.text.trim() !== "",
-      )
-      .map((block) => block.text as string);
-
+    const texts = assistantTexts(msg);
     if (texts.length > 0 && texts.join("").trim()) return texts.join("\n");
 
-    const stopReason = (msg.message as { stopReason?: unknown }).stopReason;
-    const errorMessage = (msg.message as { errorMessage?: unknown })
-      .errorMessage;
-    if (
-      stopReason === "error" &&
-      typeof errorMessage === "string" &&
-      errorMessage.trim() !== ""
-    ) {
-      return `Subagent error: ${errorMessage.trim()}`;
-    }
+    const error = assistantErrorText(msg);
+    if (error) return error;
   }
   return null;
+}
+
+/**
+ * Return the index of the last assistant message entry, or -1 when the
+ * session has none. The waiting-delivery lane uses it as its growth guard:
+ * a re-delivery is only allowed when a NEW assistant message exists (growth
+ * from user entries alone must not re-steer the previous closing text).
+ */
+export function findLastAssistantIndex(entries: SessionEntry[]): number {
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const entry = entries[i];
+    if (entry.type !== "message") continue;
+    if ((entry as MessageEntry).message?.role === "assistant") return i;
+  }
+  return -1;
 }
 
 /**

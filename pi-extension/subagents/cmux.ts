@@ -13,7 +13,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -22,6 +22,7 @@ export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm" | "herdr";
 
 const commandAvailability = new Map<string, boolean>();
 
+/** Cached for the process lifetime; mux availability is not re-checked after startup. */
 function hasCommand(command: string): boolean {
   const cached = commandAvailability.get(command);
   if (cached !== undefined) return cached;
@@ -32,12 +33,7 @@ function hasCommand(command: string): boolean {
       execFileSync("where.exe", [command], { stdio: "ignore" });
       available = true;
     } catch {
-      try {
-        execSync(`command -v ${command}`, { stdio: "ignore" });
-        available = true;
-      } catch {
-        available = false;
-      }
+      available = false;
     }
   } else {
     try {
@@ -93,14 +89,6 @@ function isHerdrRuntimeAvailable(): boolean {
 
 export function isCmuxAvailable(): boolean {
   return isCmuxRuntimeAvailable();
-}
-
-export function isTmuxAvailable(): boolean {
-  return isTmuxRuntimeAvailable();
-}
-
-export function isZellijAvailable(): boolean {
-  return isZellijRuntimeAvailable();
 }
 
 export function isWezTermAvailable(): boolean {
@@ -164,22 +152,6 @@ function requireMuxBackend(): MuxBackend {
   return backend;
 }
 
-/**
- * Detect if the user's default shell is fish.
- * Fish uses $status instead of $? for exit codes.
- */
-export function isFishShell(): boolean {
-  const shell = process.env.SHELL ?? "";
-  return basename(shell) === "fish";
-}
-
-/**
- * Return the shell-appropriate exit status variable ($? for bash/zsh, $status for fish).
- */
-export function exitStatusVar(): string {
-  return isFishShell() ? "$status" : "$?";
-}
-
 export function shellEscape(s: string): string {
   return `'${s.replace(/'/g, "'\\''")}'`;
 }
@@ -214,7 +186,6 @@ const ZELLIJ_PANE_SCOPED_ACTIONS = new Set([
   "move-pane",
   "write",
   "write-chars",
-  "send-keys",
 ]);
 
 function zellijActionArgs(args: string[], surface?: string): string[] {
@@ -575,6 +546,7 @@ function withZellijSurfaceLock<T>(callback: () => T): T {
 
       try {
         if (Date.now() - statSync(lockPath).mtimeMs > 30000) {
+          // Stale lock — older than 30s means a crashed holder left it behind.
           rmSync(lockPath, { recursive: true, force: true });
           continue;
         }
@@ -709,21 +681,25 @@ export function parseCmuxPaneRefForSurface(
     pane_ref?: unknown;
     caller?: unknown;
   };
-  if (record.surface_ref === surface && nonEmptyString(record.pane_ref))
-    return record.pane_ref;
+  const direct = paneRefForSurface(record, surface);
+  if (direct) return direct;
 
   const caller = record.caller;
   if (!caller || typeof caller !== "object") return null;
+  return paneRefForSurface(
+    caller as { surface_ref?: unknown; pane_ref?: unknown },
+    surface,
+  );
+}
 
-  const callerRecord = caller as { surface_ref?: unknown; pane_ref?: unknown };
-  if (
-    callerRecord.surface_ref === surface &&
-    nonEmptyString(callerRecord.pane_ref)
-  ) {
-    return callerRecord.pane_ref;
-  }
-
-  return null;
+/** The pane ref when `record` is for `surface` and carries a non-empty pane_ref. */
+function paneRefForSurface(
+  record: { surface_ref?: unknown; pane_ref?: unknown },
+  surface: string,
+): string | null {
+  return record.surface_ref === surface && nonEmptyString(record.pane_ref)
+    ? (record.pane_ref as string)
+    : null;
 }
 
 export function parseCmuxPaneRefForSurfaceFromJson(
@@ -1319,6 +1295,38 @@ export function selectTiledGridAnchor(
 /** Ratio deltas below this are treated as already-balanced (avoids rounding churn). */
 const HERDR_RESIZE_EPSILON = 0.01;
 
+/**
+ * Divider movement so the low side holds `lowTarget / (lowTarget + highTarget)`;
+ * null when the split is already balanced or the targets sum to zero.
+ */
+function dividerDelta(
+  lowTarget: number,
+  highTarget: number,
+  ratio: number,
+): number | null {
+  if (!(lowTarget + highTarget > 0)) return null;
+  const delta = lowTarget / (lowTarget + highTarget) - ratio;
+  if (Math.abs(delta) < HERDR_RESIZE_EPSILON) return null;
+  return delta;
+}
+
+/**
+ * Pane a divider move is anchored on (herdr resolves ops by the anchor pane):
+ * the leaf flush against the divider on the side the divider moves away from.
+ */
+function dividerAnchor(
+  axis: GridAxis,
+  delta: number,
+  lowLeaves: HerdrLayoutPane[],
+  highLeaves: HerdrLayoutPane[],
+): { anchor: HerdrLayoutPane; grow: boolean } {
+  const anchor =
+    delta > 0
+      ? [...lowLeaves].sort((a, b) => axis.low(b.rect) - axis.low(a.rect))[0]
+      : [...highLeaves].sort((a, b) => axis.low(a.rect) - axis.low(b.rect))[0];
+  return { anchor, grow: delta > 0 };
+}
+
 /** One `herdr pane resize` step: move the divider on the pane's `direction` side by `amount` (a ratio delta). */
 export interface HerdrResizeOp {
   paneId: string;
@@ -1332,21 +1340,54 @@ export interface HerdrResizeOp {
  * split's ratio is targeted independently, so nesting depth doesn't matter.
  * Panes left of the parent or partial-height are frozen. Pure — no CLI calls.
  */
-export function planHerdrRebalance(
+/**
+ * True when `pane` lies (within a ±1.5 cell tolerance for float drift) fully
+ * inside `rect`. Shared by the columns and grid rebalance planners.
+ */
+function paneInRect(pane: HerdrLayoutPane, rect: HerdrRect): boolean {
+  return (
+    pane.rect.x >= rect.x - 1.5 &&
+    pane.rect.y >= rect.y - 1.5 &&
+    pane.rect.x + pane.rect.width <= rect.x + rect.width + 1.5 &&
+    pane.rect.y + pane.rect.height <= rect.y + rect.height + 1.5
+  );
+}
+
+/**
+ * Shared guard for the herdr rebalance planners: sane layout dimensions and a
+ * full-height parent pane (within tolerance — true for the single-row column
+ * layout and the left parent grid strip alike). Returns the pieces both
+ * planners start from, or null when rebalancing must be skipped.
+ */
+function herdrBalancePreflight(
   layout: HerdrLayout,
   parentPaneId: string,
-  parentRatio: number,
-): HerdrResizeOp[] {
-  const ops: HerdrResizeOp[] = [];
+): { total: HerdrRect; parent: HerdrLayoutPane } | null {
   const total = layout.area;
-  if (!(total.width > 0) || !(total.height > 0)) return ops;
+  if (!(total.width > 0) || !(total.height > 0)) return null;
 
   const parent = layout.panes.find((pane) => pane.pane_id === parentPaneId);
-  if (!parent) return ops;
+  if (!parent) return null;
   // Balancing assumes a full-height parent in a single-row layout.
   if (parent.rect.height < total.height - 2 || parent.rect.y > total.y + 2)
-    return ops;
+    return null;
 
+  return { total, parent };
+}
+
+/**
+ * Width target per pane for the single-row column layout (parent at
+ * `parentRatio`, each column cell sharing the rest, frozen panes keep their
+ * width). Returns null when there is nothing to balance or the targets
+ * cannot fit.
+ */
+function herdrColumnTargets(
+  layout: HerdrLayout,
+  parentPaneId: string,
+  parent: HerdrLayoutPane,
+  total: HerdrRect,
+  parentRatio: number,
+): ((pane: HerdrLayoutPane) => number) | null {
   // Column cells: full-height panes starting at/after the parent's right edge.
   const parentRight = parent.rect.x + parent.rect.width;
   const cells = layout.panes
@@ -1361,7 +1402,7 @@ export function planHerdrRebalance(
 
   // Panes we won't move (left of the parent, or stacked rows): keep widths.
   const cellIds = new Set(cells.map((cell) => cell.pane_id));
-  if (cellIds.size === 0) return ops; // nothing to balance
+  if (cellIds.size === 0) return null; // nothing to balance
   const frozenSum = layout.panes
     .filter(
       (pane) => pane.pane_id !== parentPaneId && !cellIds.has(pane.pane_id),
@@ -1370,21 +1411,25 @@ export function planHerdrRebalance(
 
   const parentTarget = parentRatio * total.width;
   const remaining = total.width - parentTarget - frozenSum;
-  if (cells.length > 0 && !(remaining > 5)) return ops; // can't fit; leave the layout alone
+  if (cells.length > 0 && !(remaining > 5)) return null; // can't fit; leave the layout alone
   const cellTarget = cells.length > 0 ? remaining / cells.length : 0;
 
-  const targetWidth = (pane: HerdrLayoutPane): number => {
+  return (pane: HerdrLayoutPane): number => {
     if (pane.pane_id === parentPaneId) return parentTarget;
     if (cellIds.has(pane.pane_id)) return cellTarget;
     return pane.rect.width; // frozen
   };
+}
 
-  const inRect = (pane: HerdrLayoutPane, rect: HerdrRect): boolean =>
-    pane.rect.x >= rect.x - 1.5 &&
-    pane.rect.y >= rect.y - 1.5 &&
-    pane.rect.x + pane.rect.width <= rect.x + rect.width + 1.5 &&
-    pane.rect.y + pane.rect.height <= rect.y + rect.height + 1.5;
-
+/**
+ * Walk the vertical splits outermost-first, moving each divider toward its
+ * side's width target. Empty when any divider move is ambiguous — herdr
+ * could move either of two coincident dividers, so no op can be trusted.
+ */
+function herdrColumnDividerOps(
+  layout: HerdrLayout,
+  targetWidth: (pane: HerdrLayoutPane) => number,
+): HerdrResizeOp[] {
   // Outermost splits first.
   const rightSplits = layout.splits.filter(
     (split) => split.direction === "right",
@@ -1392,17 +1437,12 @@ export function planHerdrRebalance(
   const splits = [...rightSplits].sort(
     (a, b) => b.rect.width * b.rect.height - a.rect.width * a.rect.height,
   );
-  const dividerXOf = (split: HerdrLayoutSplit): number =>
-    split.rect.x + split.rect.width * split.ratio;
-  const overlapsY = (anchor: HerdrLayoutPane, rect: HerdrRect): boolean =>
-    anchor.rect.y < rect.y + rect.height + 1.5 &&
-    anchor.rect.y + anchor.rect.height > rect.y - 1.5;
 
-  // Coincident dividers make a resize ambiguous (see guard below) — bail.
   let ambiguous = false;
+  const ops: HerdrResizeOp[] = [];
 
   for (const split of splits) {
-    const dividerX = dividerXOf(split);
+    const dividerX = split.rect.x + split.rect.width * split.ratio;
     const leftRect: HerdrRect = {
       x: split.rect.x,
       y: split.rect.y,
@@ -1415,8 +1455,12 @@ export function planHerdrRebalance(
       width: split.rect.x + split.rect.width - dividerX,
       height: split.rect.height,
     };
-    const leftLeaves = layout.panes.filter((pane) => inRect(pane, leftRect));
-    const rightLeaves = layout.panes.filter((pane) => inRect(pane, rightRect));
+    const leftLeaves = layout.panes.filter((pane) =>
+      paneInRect(pane, leftRect),
+    );
+    const rightLeaves = layout.panes.filter((pane) =>
+      paneInRect(pane, rightRect),
+    );
     if (leftLeaves.length === 0 || rightLeaves.length === 0) continue;
 
     const leftTarget = leftLeaves.reduce(
@@ -1427,36 +1471,24 @@ export function planHerdrRebalance(
       (sum, pane) => sum + targetWidth(pane),
       0,
     );
-    if (!(leftTarget + rightTarget > 0)) continue;
+    const delta = dividerDelta(leftTarget, rightTarget, split.ratio);
+    if (delta === null) continue;
 
-    const delta = leftTarget / (leftTarget + rightTarget) - split.ratio;
-    if (Math.abs(delta) < HERDR_RESIZE_EPSILON) continue;
-
-    let anchor: HerdrLayoutPane;
-    let grow: boolean;
-    if (delta > 0) {
-      // Grow: move the divider right, anchored on the pane beside it.
-      anchor = [...leftLeaves].sort((a, b) => b.rect.x - a.rect.x)[0];
-      grow = true;
-    } else {
-      // Shrink: same divider, from the right side.
-      anchor = [...rightLeaves].sort((a, b) => a.rect.x - b.rect.x)[0];
-      grow = false;
-    }
+    const { anchor, grow } = dividerAnchor(
+      AXIS_X,
+      delta,
+      leftLeaves,
+      rightLeaves,
+    );
 
     // Skip if another split's divider coincides with this one — herdr could
     // move either one. Only happens in legacy layouts this code never creates.
     const anchorEdge = grow ? anchor.rect.x + anchor.rect.width : anchor.rect.x;
     if (Math.abs(anchorEdge - dividerX) > 1.5) continue;
-    for (const other of rightSplits) {
-      if (other === split) continue;
-      if (!overlapsY(anchor, other.rect)) continue;
-      if (Math.abs(dividerXOf(other) - dividerX) <= 1.5) {
-        ambiguous = true;
-        break;
-      }
+    if (hasCoincidentDivider(rightSplits, split, anchor, dividerX)) {
+      ambiguous = true;
+      break;
     }
-    if (ambiguous) break;
 
     ops.push({
       paneId: anchor.pane_id,
@@ -1464,8 +1496,48 @@ export function planHerdrRebalance(
       amount: grow ? delta : -delta,
     });
   }
-  if (ambiguous) return [];
-  return ops;
+  return ambiguous ? [] : ops;
+}
+
+export function planHerdrRebalance(
+  layout: HerdrLayout,
+  parentPaneId: string,
+  parentRatio: number,
+): HerdrResizeOp[] {
+  const pre = herdrBalancePreflight(layout, parentPaneId);
+  if (!pre) return [];
+  const targetWidth = herdrColumnTargets(
+    layout,
+    parentPaneId,
+    pre.parent,
+    pre.total,
+    parentRatio,
+  );
+  if (!targetWidth) return [];
+  return herdrColumnDividerOps(layout, targetWidth);
+}
+
+/**
+ * True when another split's divider is coincident with `dividerX` while
+ * overlapping `anchor` vertically — herdr could move either one, so the
+ * resize is ambiguous and the whole plan must abort.
+ */
+function hasCoincidentDivider(
+  rightSplits: HerdrLayoutSplit[],
+  split: HerdrLayoutSplit,
+  anchor: HerdrLayoutPane,
+  dividerX: number,
+): boolean {
+  const overlapsY = (rect: HerdrRect): boolean =>
+    anchor.rect.y < rect.y + rect.height + 1.5 &&
+    anchor.rect.y + anchor.rect.height > rect.y - 1.5;
+  for (const other of rightSplits) {
+    if (other === split) continue;
+    if (!overlapsY(other.rect)) continue;
+    const otherX = other.rect.x + other.rect.width * other.ratio;
+    if (Math.abs(otherX - dividerX) <= 1.5) return true;
+  }
+  return false;
 }
 
 /** Axis-specific accessors, so one planner serves both divider orientations. */
@@ -1509,6 +1581,25 @@ const AXIS_Y: GridAxis = {
 };
 
 /**
+ * Bounding-box extent of the leaves' target rects along `axis` (stacked panes
+ * share columns/rows, so summing extents would double-count).
+ */
+function dividerSideExtent(
+  axis: GridAxis,
+  leaves: HerdrLayoutPane[],
+  targetRectOf: (pane: HerdrLayoutPane) => HerdrRect,
+): number {
+  let low = Infinity;
+  let high = -Infinity;
+  for (const leaf of leaves) {
+    const rect = targetRectOf(leaf);
+    low = Math.min(low, axis.low(rect));
+    high = Math.max(high, axis.low(rect) + axis.size(rect));
+  }
+  return Number.isFinite(low) ? high - low : 0;
+}
+
+/**
  * Plan resize ops for one axis's dividers: each divider moves so its low side
  * holds `lowTarget / (lowTarget + highTarget)` of the split ratio, where the
  * side targets are bounding-box extents of the leaves' target rects (stacked
@@ -1524,52 +1615,29 @@ function planDividerOps(
   splits: HerdrLayoutSplit[],
   layout: HerdrLayout,
   targetRectOf: (pane: HerdrLayoutPane) => HerdrRect,
-  inRect: (pane: HerdrLayoutPane, rect: HerdrRect) => boolean,
 ): HerdrResizeOp[] {
   const ops: HerdrResizeOp[] = [];
-  const targetExtentOf = (leaves: HerdrLayoutPane[]): number => {
-    let low = Infinity;
-    let high = -Infinity;
-    for (const leaf of leaves) {
-      const rect = targetRectOf(leaf);
-      low = Math.min(low, axis.low(rect));
-      high = Math.max(high, axis.low(rect) + axis.size(rect));
-    }
-    return Number.isFinite(low) ? high - low : 0;
-  };
 
   for (const split of splits) {
     const start = axis.low(split.rect);
     const span = axis.size(split.rect);
     const divider = start + span * split.ratio;
     const lowLeaves = layout.panes.filter((pane) =>
-      inRect(pane, axis.subRect(split, start, divider - start)),
+      paneInRect(pane, axis.subRect(split, start, divider - start)),
     );
     const highLeaves = layout.panes.filter((pane) =>
-      inRect(pane, axis.subRect(split, divider, start + span - divider)),
+      paneInRect(pane, axis.subRect(split, divider, start + span - divider)),
     );
     if (lowLeaves.length === 0 || highLeaves.length === 0) continue;
 
-    const lowTarget = targetExtentOf(lowLeaves);
-    const highTarget = targetExtentOf(highLeaves);
-    if (!(lowTarget + highTarget > 0)) continue;
+    const delta = dividerDelta(
+      dividerSideExtent(axis, lowLeaves, targetRectOf),
+      dividerSideExtent(axis, highLeaves, targetRectOf),
+      split.ratio,
+    );
+    if (delta === null) continue;
 
-    const delta = lowTarget / (lowTarget + highTarget) - split.ratio;
-    if (Math.abs(delta) < HERDR_RESIZE_EPSILON) continue;
-
-    let anchor: HerdrLayoutPane;
-    let grow: boolean;
-    if (delta > 0) {
-      anchor = [...lowLeaves].sort(
-        (a, b) => axis.low(b.rect) - axis.low(a.rect),
-      )[0];
-      grow = true;
-    } else {
-      anchor = [...highLeaves].sort(
-        (a, b) => axis.low(a.rect) - axis.low(b.rect),
-      )[0];
-      grow = false;
-    }
+    const { anchor, grow } = dividerAnchor(axis, delta, lowLeaves, highLeaves);
 
     const anchorEdge = grow
       ? axis.low(anchor.rect) + axis.size(anchor.rect)
@@ -1587,10 +1655,10 @@ function planDividerOps(
 
 /**
  * Plan resizes that lay the tab out as a tiled grid: parent at `parentRatio`
- * width on the left, tracked panes (fill order) in a ceil(sqrt(n)) ×
- * ceil(n/cols) grid of equal cells to its right. Handles both right-splits
- * (vertical dividers) and down-splits (horizontal dividers); untracked panes
- * are frozen. Pure — no CLI calls.
+ * width on the left, tracked panes (fill order) in the `gridDimsForCount`
+ * grid (round(sqrt(n)) rows × ceil(n/rows) columns) of equal cells to its
+ * right. Handles both right-splits (vertical dividers) and down-splits
+ * (horizontal dividers); untracked panes are frozen. Pure — no CLI calls.
  */
 export function planHerdrGridRebalance(
   layout: HerdrLayout,
@@ -1598,15 +1666,10 @@ export function planHerdrGridRebalance(
   trackedPaneIds: string[],
   parentRatio: number,
 ): HerdrResizeOp[] {
+  const pre = herdrBalancePreflight(layout, parentPaneId);
+  if (!pre) return [];
+  const { total, parent } = pre;
   const ops: HerdrResizeOp[] = [];
-  const total = layout.area;
-  if (!(total.width > 0) || !(total.height > 0)) return ops;
-
-  const parent = layout.panes.find((pane) => pane.pane_id === parentPaneId);
-  if (!parent) return ops;
-  // Balancing assumes a full-height parent strip on the left.
-  if (parent.rect.height < total.height - 2 || parent.rect.y > total.y + 2)
-    return ops;
 
   const tracked = trackedPaneIds.filter((id) =>
     layout.panes.some((pane) => pane.pane_id === id),
@@ -1627,12 +1690,6 @@ export function planHerdrGridRebalance(
     return targets.cells.get(pane.pane_id) ?? pane.rect; // frozen when untracked
   };
 
-  const inRect = (pane: HerdrLayoutPane, rect: HerdrRect): boolean =>
-    pane.rect.x >= rect.x - 1.5 &&
-    pane.rect.y >= rect.y - 1.5 &&
-    pane.rect.x + pane.rect.width <= rect.x + rect.width + 1.5 &&
-    pane.rect.y + pane.rect.height <= rect.y + rect.height + 1.5;
-
   const byAreaDesc = (a: HerdrLayoutSplit, b: HerdrLayoutSplit): number =>
     b.rect.width * b.rect.height - a.rect.width * a.rect.height;
   const verticalDividers = layout.splits
@@ -1643,8 +1700,8 @@ export function planHerdrGridRebalance(
     .sort(byAreaDesc);
 
   ops.push(
-    ...planDividerOps(AXIS_X, verticalDividers, layout, targetRectOf, inRect),
-    ...planDividerOps(AXIS_Y, horizontalDividers, layout, targetRectOf, inRect),
+    ...planDividerOps(AXIS_X, verticalDividers, layout, targetRectOf),
+    ...planDividerOps(AXIS_Y, horizontalDividers, layout, targetRectOf),
   );
   return ops;
 }
@@ -1847,10 +1904,10 @@ function rebalanceHerdrLayoutForMode(parentPaneId: string): void {
 /**
  * Create a herdr subagent surface. In "columns" mode (default) the parent
  * keeps its width and new subagents split the rightmost subagent pane so all
- * subagent panes stay equal width. In "tiled" mode subagents fill a
- * ceil(sqrt(n)) × ceil(n/cols) grid right of the parent: each spawn splits
- * the pane covering the next grid cell (right/down) and the grid is
- * rebalanced afterwards.
+ * subagent panes stay equal width. In "tiled" mode subagents fill the
+ * gridDimsForCount grid (round(sqrt(n)) rows × ceil(n/rows) columns) right
+ * of the parent: each spawn splits the pane covering the next grid cell
+ * (right/down) and the grid is rebalanced afterwards.
  */
 function createHerdrSubagentSurface(name: string): string {
   const parentPaneId = process.env.HERDR_PANE_ID;
@@ -1993,15 +2050,22 @@ export interface TmuxResizeOp {
  * Plan absolute-width resizes: parent at `parentRatio` of the window, every
  * full-height pane to its right sharing the rest equally. Pure — no CLI calls.
  */
-export function planTmuxRebalance(
+/**
+ * Parent pane and the full-height column cells right of it for the
+ * single-row column layout, or null when there is nothing to balance.
+ */
+function tmuxColumnLayout(
   panes: TmuxPaneGeometry[],
   parentPaneId: string,
-  parentRatio: number,
-): TmuxResizeOp[] {
+): {
+  parent: TmuxPaneGeometry;
+  windowWidth: number;
+  cells: TmuxPaneGeometry[];
+} | null {
   const parent = panes.find((pane) => pane.paneId === parentPaneId);
-  if (!parent) return [];
+  if (!parent) return null;
   const windowWidth = parent.windowWidth;
-  if (!(windowWidth > 0) || !(parent.width > 0)) return [];
+  if (!(windowWidth > 0) || !(parent.width > 0)) return null;
 
   const parentRight = parent.left + parent.width;
   const cells = panes
@@ -2013,7 +2077,28 @@ export function planTmuxRebalance(
         pane.top <= parent.top + 1,
     )
     .sort((a, b) => a.top - b.top || a.left - b.left);
-  if (cells.length === 0) return [];
+  if (cells.length === 0) return null;
+  return { parent, windowWidth, cells };
+}
+
+/** Absolute-width resize toward `target`, or undefined when within 1 column. */
+function tmuxWidthOp(
+  paneId: string,
+  current: number,
+  target: number,
+): TmuxResizeOp | undefined {
+  if (Math.abs(current - target) <= 1) return undefined;
+  return { paneId, width: target };
+}
+
+export function planTmuxRebalance(
+  panes: TmuxPaneGeometry[],
+  parentPaneId: string,
+  parentRatio: number,
+): TmuxResizeOp[] {
+  const layout = tmuxColumnLayout(panes, parentPaneId);
+  if (!layout) return [];
+  const { parent, windowWidth, cells } = layout;
 
   const parentTarget = Math.round(parentRatio * windowWidth);
   const remaining = windowWidth - parentTarget;
@@ -2022,13 +2107,11 @@ export function planTmuxRebalance(
 
   const cellTarget = Math.floor(remaining / cells.length);
   const ops: TmuxResizeOp[] = [];
-  if (Math.abs(parent.width - parentTarget) > 1) {
-    ops.push({ paneId: parentPaneId, width: parentTarget });
-  }
+  const parentOp = tmuxWidthOp(parentPaneId, parent.width, parentTarget);
+  if (parentOp) ops.push(parentOp);
   for (const cell of cells) {
-    if (Math.abs(cell.width - cellTarget) > 1) {
-      ops.push({ paneId: cell.paneId, width: cellTarget });
-    }
+    const op = tmuxWidthOp(cell.paneId, cell.width, cellTarget);
+    if (op) ops.push(op);
   }
   return ops;
 }
@@ -2238,10 +2321,10 @@ function rightmostTmuxAnchor(
 /**
  * Create a tmux subagent surface. In "columns" mode (default) the parent
  * keeps its width and new subagents split the rightmost subagent pane so all
- * subagent panes stay equal width. In "tiled" mode subagents fill a
- * ceil(sqrt(n)) × ceil(n/cols) grid right of the parent: each spawn splits
- * the pane covering the next grid cell (right/down) and the grid is
- * rebalanced afterwards.
+ * subagent panes stay equal width. In "tiled" mode subagents fill the
+ * gridDimsForCount grid (round(sqrt(n)) rows × ceil(n/rows) columns) right
+ * of the parent: each spawn splits the pane covering the next grid cell
+ * (right/down) and the grid is rebalanced afterwards.
  */
 function createTmuxSubagentSurface(name: string): string {
   const parentPaneId = process.env.TMUX_PANE;
@@ -2326,7 +2409,9 @@ function isHerdrAgentWorking(surface: string): Promise<boolean> {
  * For zellij: chooses a tab-aware tiled or stacked placement.
  * For herdr: splits the rightmost subagent pane (no focus steal), keeping the
  * parent pane at a fixed width, then rebalances so all subagent panes are
- * equally wide (`PI_SUBAGENT_HERDR_PARENT_RATIO`, default 0.4).
+ * equally wide (`PI_SUBAGENT_HERDR_PARENT_RATIO`, default 0.4). In "tiled"
+ * mode both herdr and tmux instead fill a grid right of the parent — see
+ * createHerdrSubagentSurface / createTmuxSubagentSurface.
  * For tmux: same balanced layout as herdr (`PI_SUBAGENT_TMUX_PARENT_RATIO`),
  * using absolute `resize-pane -x` widths.
  * For wezterm: falls back to split behavior.
@@ -2717,6 +2802,8 @@ export function sendCommand(surface: string, command: string): void {
   }
 
   zellijActionSync(["write-chars", command], surface);
+  // zellij "write" takes raw bytes — 13 = Enter (CR), the tmux/herdr
+  // equivalents send the named "Enter" key.
   zellijActionSync(["write", "13"], surface);
 }
 
@@ -2758,6 +2845,7 @@ export function sendEscape(surface: string): void {
     return;
   }
 
+  // 27 = Escape.
   zellijActionSync(["write", "27"], surface);
 }
 
@@ -2845,17 +2933,11 @@ export function readScreen(surface: string, lines = 50): string {
     return tailLines(raw, lines);
   }
 
-  // Zellij 0.44+: use --pane-id flag + stdout instead of env var + temp file.
-  // The ZELLIJ_PANE_ID env var doesn't reliably target other panes for dump-screen,
-  // and --path may silently fail to create the file. Stdout capture is robust.
-  const paneId = zellijPaneId(surface);
-  const raw = execFileSync(
-    "zellij",
-    ["action", "dump-screen", "--pane-id", paneId],
-    {
-      encoding: "utf8",
-    },
-  );
+  // Zellij 0.44+: dump-screen to stdout via --pane-id instead of env var +
+  // temp file. The ZELLIJ_PANE_ID env var doesn't reliably target other panes
+  // for dump-screen, and --path may silently fail to create the file. Stdout
+  // capture is robust.
+  const raw = zellijActionSync(["dump-screen"], surface);
   return tailLines(raw, lines);
 }
 
@@ -2906,11 +2988,10 @@ export async function readScreenAsync(
     return tailLines(stdout, lines);
   }
 
-  // Zellij 0.44+: use --pane-id flag + stdout instead of env var + temp file.
-  const paneId = zellijPaneId(surface);
+  // Zellij 0.44+: dump-screen to stdout via --pane-id (see readScreen).
   const { stdout } = await execFileAsync(
     "zellij",
-    ["action", "dump-screen", "--pane-id", paneId],
+    zellijActionArgs(["dump-screen"], surface),
     {
       encoding: "utf8",
     },
@@ -2988,6 +3069,22 @@ interface ExitSidecarPayload {
 }
 
 /**
+ * Read + consume the `.exit` sidecar for a session file. Returns the decoded
+ * PollResult, or null when the sidecar does not exist / is not yet readable.
+ */
+function readExitSidecar(sessionFile: string): PollResult | null {
+  const exitFile = `${sessionFile}.exit`;
+  try {
+    if (!existsSync(exitFile)) return null;
+    const data = JSON.parse(readFileSync(exitFile, "utf8"));
+    rmSync(exitFile, { force: true });
+    return interpretExitSidecar(data);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Interpret an `.exit` sidecar payload (written by subagent_done / caller_ping /
  * the error path in subagent-done.ts). Centralized so both the fast and slow
  * paths in pollForExit decode the payload the same way.
@@ -3044,14 +3141,8 @@ export async function pollForExit(
 
     // Fast path: check for .exit sidecar file (written by subagent_done / caller_ping)
     if (options.sessionFile) {
-      try {
-        const exitFile = `${options.sessionFile}.exit`;
-        if (existsSync(exitFile)) {
-          const data = JSON.parse(readFileSync(exitFile, "utf8"));
-          rmSync(exitFile, { force: true });
-          return interpretExitSidecar(data);
-        }
-      } catch {}
+      const sidecar = readExitSidecar(options.sessionFile);
+      if (sidecar) return sidecar;
     }
 
     // Check Claude sentinel file (written by plugin Stop hook)
@@ -3073,14 +3164,8 @@ export async function pollForExit(
     } catch {
       // Surface may have been destroyed — check if .exit file appeared in the meantime
       if (options.sessionFile) {
-        try {
-          const exitFile = `${options.sessionFile}.exit`;
-          if (existsSync(exitFile)) {
-            const data = JSON.parse(readFileSync(exitFile, "utf8"));
-            rmSync(exitFile, { force: true });
-            return interpretExitSidecar(data);
-          }
-        } catch {}
+        const sidecar = readExitSidecar(options.sessionFile);
+        if (sidecar) return sidecar;
       }
     }
 

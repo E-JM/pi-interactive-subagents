@@ -2,6 +2,8 @@
  * Extension loaded into sub-agents.
  * - Shows agent identity + available tools as a styled widget above the editor (toggle with Ctrl+J)
  * - Provides a `subagent_done` tool for autonomous agents to self-terminate
+ * - Provides a `caller_ping` tool for subagents to hand a question back to the
+ *   parent (exits the child; the parent resumes via subagent_message)
  */
 
 import { writeFileSync } from "node:fs";
@@ -21,18 +23,20 @@ export interface AgentTurnMessage {
   errorMessage?: string;
 }
 
+/**
+ * Decide whether an auto-exit subagent should shut down when an agent turn
+ * ends. Kept independent of who drove the run: if the latest agent turn
+ * completed normally, close the session. Escape/abort still leaves it
+ * open for inspection or another prompt.
+ *
+ * stopReason: "error" (e.g. exhausted retries on a provider overload) also
+ * returns true — we want to shut down so the parent is woken up — but we
+ * pair this with findLatestAssistantError() so the parent learns it was an
+ * error, not a clean completion.
+ */
 export function shouldAutoExitOnAgentEnd(
-  _userTookOver: boolean,
   messages: AgentTurnMessage[] | undefined,
 ): boolean {
-  // Manual input should not strand an auto-exit subagent. If the latest agent
-  // turn completed normally, close the session. Escape/abort still leaves it
-  // open for inspection or another prompt.
-  //
-  // stopReason: "error" (e.g. exhausted retries on a provider overload) also
-  // returns true — we want to shut down so the parent is woken up — but we
-  // pair this with findLatestAssistantError() so the parent learns it was an
-  // error, not a clean completion.
   if (messages) {
     for (let i = messages.length - 1; i >= 0; i--) {
       const msg = messages[i];
@@ -163,9 +167,6 @@ export default function (pi: ExtensionAPI) {
     );
   }
 
-  let userTookOver = false;
-  let agentStarted = false;
-
   pi.on("session_start", (_event, ctx) => {
     recorder.sessionStart();
     const tools = pi.getAllTools();
@@ -177,10 +178,6 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("input", () => {
     recorder.input();
-    // Ignore the initial task message that starts an autonomous subagent.
-    // Only inputs after the first agent run has started count as user takeover.
-    if (!agentStarted) return;
-    userTookOver = true;
   });
 
   pi.on("before_agent_start", () => {
@@ -188,15 +185,13 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_start", () => {
-    agentStarted = true;
     recorder.agentStart();
   });
 
   pi.on("agent_end", (event, ctx) => {
     // AgentMessage satisfies the structural AgentTurnMessage view.
     const messages = event.messages as AgentTurnMessage[];
-    const shouldExit =
-      autoExit && shouldAutoExitOnAgentEnd(userTookOver, messages);
+    const shouldExit = autoExit && shouldAutoExitOnAgentEnd(messages);
 
     if (shouldExit) {
       // Surface stopReason: "error" turns (auto-retry exhausted, provider
@@ -228,11 +223,6 @@ export default function (pi: ExtensionAPI) {
     }
 
     recorder.agentEndWaiting();
-    if (autoExit) {
-      // Reset any recorded manual input marker. Auto-exit is decided by whether
-      // the latest agent turn completed normally, not by who initiated it.
-      userTookOver = false;
-    }
   });
 
   pi.on("turn_start", (event) => {

@@ -1,5 +1,9 @@
 {
   "status": {
     "enabled": true
+  },
+  "completion": {
+    "steerDebounceMs": 3000,
+    "idleCloseMs": 600000
   }
 }
