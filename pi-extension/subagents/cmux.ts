@@ -1571,9 +1571,10 @@ function herdrColumnDividerOps(
     // divider. Skip this split rather than guess.
     const anchorEdge = grow ? anchor.rect.x + anchor.rect.width : anchor.rect.x;
     if (Math.abs(anchorEdge - dividerX) > 1.5) continue;
-    // A coincident divider from another split (nested layouts this code
-    // never builds) makes the move ambiguous — herdr could push either one
-    // — so abort the whole plan instead of resizing an arbitrary pane.
+    // A coincident divider from another split (possible in nested layouts,
+    // e.g. a user split inside a column) makes the move ambiguous — herdr
+    // could push either one — so abort the whole plan instead of resizing
+    // an arbitrary pane.
     if (hasCoincidentDivider(rightSplits, split, anchor, dividerX)) {
       ambiguous = true;
       break;
