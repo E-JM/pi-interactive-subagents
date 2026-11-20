@@ -2310,44 +2310,11 @@ async function selectSubagentLayout(
   );
 }
 
-export default function subagentsExtension(pi: ExtensionAPI) {
-  // Capture the UI context for widget updates
-  pi.on("session_start", (_event, ctx) => {
-    latestCtx = ctx;
-  });
-
-  // Clean up on session shutdown
-  pi.on("session_shutdown", (_event, _ctx) => {
-    if (widgetInterval) {
-      clearInterval(widgetInterval);
-      widgetInterval = null;
-      globalStore[WIDGET_INTERVAL_KEY] = null;
-    }
-    if (supervisionInterval) {
-      clearInterval(supervisionInterval);
-      supervisionInterval = null;
-      globalStore[STATUS_INTERVAL_KEY] = null;
-    }
-    const moduleAbort = globalStore[POLL_ABORT_KEY] as
-      | AbortController
-      | undefined;
-    if (moduleAbort) moduleAbort.abort();
-    for (const [_id, agent] of runningSubagents) {
-      agent.abortController?.abort();
-    }
-    runningSubagents.clear();
-  });
-
-  // Tools denied via PI_DENY_TOOLS env var (set by parent agent based on frontmatter)
-  const deniedTools = new Set(
-    (process.env.PI_DENY_TOOLS ?? "")
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean),
-  );
-
-  const shouldRegister = (name: string) => !deniedTools.has(name);
-
+function registerSubagentSpawnTool(
+  pi: ExtensionAPI,
+  shouldRegister: (name: string) => boolean,
+): void {
+  if (!shouldRegister("subagent")) return;
   if (shouldRegister("subagent"))
     pi.registerTool({
       name: "subagent",
@@ -2491,7 +2458,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         return renderResultFallback(result, theme);
       },
     });
+}
 
+function registerSubagentInterruptTool(
+  pi: ExtensionAPI,
+  shouldRegister: (name: string) => boolean,
+): void {
+  if (!shouldRegister("subagent_interrupt")) return;
   if (shouldRegister("subagent_interrupt"))
     pi.registerTool({
       name: "subagent_interrupt",
@@ -2534,7 +2507,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         return renderResultFallback(result, theme);
       },
     });
+}
 
+function registerSubagentsListTool(
+  pi: ExtensionAPI,
+  shouldRegister: (name: string) => boolean,
+): void {
+  if (!shouldRegister("subagents_list")) return;
   if (shouldRegister("subagents_list"))
     pi.registerTool({
       name: "subagents_list",
@@ -2590,7 +2569,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         return new Text(lines.join("\n"), 0, 0);
       },
     });
+}
 
+function registerSubagentMessageTool(
+  pi: ExtensionAPI,
+  shouldRegister: (name: string) => boolean,
+): void {
+  if (!shouldRegister("subagent_message")) return;
   if (shouldRegister("subagent_message"))
     pi.registerTool({
       name: "subagent_message",
@@ -2880,7 +2865,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         };
       },
     });
+}
 
+function registerSubagentCloseTool(
+  pi: ExtensionAPI,
+  shouldRegister: (name: string) => boolean,
+): void {
+  if (!shouldRegister("subagent_close")) return;
   if (shouldRegister("subagent_close"))
     pi.registerTool({
       name: "subagent_close",
@@ -2940,8 +2931,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         return renderResultFallback(result, theme);
       },
     });
+}
 
-  // /iterate command — fork the session into a subagent
+function registerSubagentCommands(pi: ExtensionAPI): void {
   pi.registerCommand("iterate", {
     description:
       "Fork session into a subagent for focused work (bugfixes, iteration)",
@@ -2954,7 +2946,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     },
   });
 
-  // /subagent command — spawn a subagent by name
   pi.registerCommand("subagent", {
     description: "Spawn a subagent: /subagent <agent> <task>",
     handler: async (args, ctx) => {
@@ -2985,7 +2976,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     },
   });
 
-  // /subagent-layout command — pick subagent pane layout (herdr/tmux)
   pi.registerCommand("subagent-layout", {
     description: "Subagent pane layout: columns ↔ tiled grid (herdr/tmux)",
     getArgumentCompletions: (argumentPrefix) => {
@@ -3020,6 +3010,38 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("plan", {
+    description: "Start a planning session: /plan <what to build>",
+    handler: async (args, ctx) => {
+      const task = args.trim();
+      if (!task) {
+        ctx.ui.notify("Usage: /plan <what to build>", "warning");
+        return;
+      }
+
+      // Rename workspace and tab to show this is a planning session
+      if (isMuxAvailable()) {
+        try {
+          const label = task.length > 40 ? `${task.slice(0, 40)}...` : task;
+          renameWorkspace(`🎯 ${label}`);
+          renameCurrentTab(`🎯 Plan: ${label}`);
+        } catch {
+          // non-critical -- do not block the plan
+        }
+      }
+
+      // Load the plan skill from the subagents extension directory
+      const planSkillPath = join(SUBAGENTS_DIR, "plan-skill.md");
+      let content = readFileSync(planSkillPath, "utf8");
+      content = content.replace(/^---\n[\s\S]*?\n---\n*/, "");
+      pi.sendUserMessage(
+        `<skill name="plan" location="${planSkillPath}">\n${content.trim()}\n</skill>\n\n${task}`,
+      );
+    },
+  });
+}
+
+function registerSubagentMessageRenderers(pi: ExtensionAPI): void {
   pi.registerMessageRenderer("subagent_result", (message, options, theme) => {
     if (message.details == null) return undefined;
     const details = detailsOf(message.details);
@@ -3182,35 +3204,59 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
     };
   });
+}
+
+export default function subagentsExtension(pi: ExtensionAPI) {
+  // Capture the UI context for widget updates
+  pi.on("session_start", (_event, ctx) => {
+    latestCtx = ctx;
+  });
+
+  // Clean up on session shutdown
+  pi.on("session_shutdown", (_event, _ctx) => {
+    if (widgetInterval) {
+      clearInterval(widgetInterval);
+      widgetInterval = null;
+      globalStore[WIDGET_INTERVAL_KEY] = null;
+    }
+    if (supervisionInterval) {
+      clearInterval(supervisionInterval);
+      supervisionInterval = null;
+      globalStore[STATUS_INTERVAL_KEY] = null;
+    }
+    const moduleAbort = globalStore[POLL_ABORT_KEY] as
+      | AbortController
+      | undefined;
+    if (moduleAbort) moduleAbort.abort();
+    for (const [_id, agent] of runningSubagents) {
+      agent.abortController?.abort();
+    }
+    runningSubagents.clear();
+  });
+
+  // Tools denied via PI_DENY_TOOLS env var (set by parent agent based on frontmatter)
+  const deniedTools = new Set(
+    (process.env.PI_DENY_TOOLS ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean),
+  );
+
+  const shouldRegister = (name: string) => !deniedTools.has(name);
+
+  registerSubagentSpawnTool(pi, shouldRegister);
+  registerSubagentInterruptTool(pi, shouldRegister);
+  registerSubagentsListTool(pi, shouldRegister);
+  registerSubagentMessageTool(pi, shouldRegister);
+  registerSubagentCloseTool(pi, shouldRegister);
+  registerSubagentCommands(pi);
+  registerSubagentMessageRenderers(pi);
+
+  // /iterate command — fork the session into a subagent
+
+  // /subagent command — spawn a subagent by name
+
+  // /subagent-layout command — pick subagent pane layout (herdr/tmux)
 
   // /plan command — start the full planning workflow
-  pi.registerCommand("plan", {
-    description: "Start a planning session: /plan <what to build>",
-    handler: async (args, ctx) => {
-      const task = args.trim();
-      if (!task) {
-        ctx.ui.notify("Usage: /plan <what to build>", "warning");
-        return;
-      }
-
-      // Rename workspace and tab to show this is a planning session
-      if (isMuxAvailable()) {
-        try {
-          const label = task.length > 40 ? `${task.slice(0, 40)}...` : task;
-          renameWorkspace(`🎯 ${label}`);
-          renameCurrentTab(`🎯 Plan: ${label}`);
-        } catch {
-          // non-critical -- do not block the plan
-        }
-      }
-
-      // Load the plan skill from the subagents extension directory
-      const planSkillPath = join(SUBAGENTS_DIR, "plan-skill.md");
-      let content = readFileSync(planSkillPath, "utf8");
-      content = content.replace(/^---\n[\s\S]*?\n---\n*/, "");
-      pi.sendUserMessage(
-        `<skill name="plan" location="${planSkillPath}">\n${content.trim()}\n</skill>\n\n${task}`,
-      );
-    },
-  });
 }
