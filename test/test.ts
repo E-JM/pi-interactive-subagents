@@ -158,6 +158,24 @@ function restoreEnvVar(name: string, value: string | undefined) {
   process.env[name] = value;
 }
 
+// Extension registration and mux detection consult these env vars; a stray
+// export (e.g. PI_DENY_TOOLS in reviewer sessions) silently disables tools
+// and breaks unrelated tests. Snapshot-and-clear once for the whole file;
+// tests that need specific values set and restore their own.
+const GATED_ENV_KEYS = [
+  "PI_DENY_TOOLS",
+  "PI_SUBAGENT_MUX",
+  "CMUX_SOCKET_PATH",
+  "PI_SUBAGENT_AGENT",
+];
+const gatedEnvSaved = new Map(GATED_ENV_KEYS.map((k) => [k, process.env[k]]));
+before(() => {
+  for (const key of GATED_ENV_KEYS) delete process.env[key];
+});
+after(() => {
+  for (const key of GATED_ENV_KEYS) restoreEnvVar(key, gatedEnvSaved.get(key));
+});
+
 function withMockedNow<T>(now: number, fn: () => T): T {
   const originalNow = Date.now;
   Date.now = () => now;
@@ -2203,6 +2221,147 @@ describe("tool registration", () => {
     assert.ok(closeTool, "expected subagent_close tool to be registered");
     assert.ok(closeTool.parameters.properties.name);
     assert.ok(closeTool.parameters.properties.id);
+  });
+});
+
+describe("tool execute error paths", () => {
+  const theme = {
+    fg(_color: string, text: string) {
+      return text;
+    },
+    bg(_color: string, text: string) {
+      return text;
+    },
+    bold(text: string) {
+      return text;
+    },
+  };
+
+  function boot() {
+    const mock = createMockExtensionApi();
+    (subagentsModule as any).default(mock.api);
+    return mock;
+  }
+
+  async function executeTool(
+    name: string,
+    params: object,
+    env?: Record<string, string>,
+  ) {
+    const saved = new Map(
+      Object.keys(env ?? {}).map((k) => [k, process.env[k]]),
+    );
+    try {
+      Object.assign(process.env, env);
+      const mock = boot();
+      const tool = mock.registeredTools.find((t) => t.name === name);
+      assert.ok(tool, `expected ${name} tool to be registered`);
+      return await tool.execute("test-id", params, undefined, undefined, {});
+    } finally {
+      for (const [k, v] of saved) restoreEnvVar(k, v);
+    }
+  }
+
+  it("subagent blocks self-spawning of the current agent", async () => {
+    const result = await executeTool(
+      "subagent",
+      { agent: "planner", task: "plan more" },
+      { PI_SUBAGENT_AGENT: "planner" },
+    );
+    assert.equal(result.details.error, "self-spawn blocked");
+    assert.match(result.content[0].text, /do not start another planner/);
+  });
+
+  it("subagent reports a missing multiplexer instead of launching", async () => {
+    const result = await executeTool(
+      "subagent",
+      { task: "do work" },
+      { PI_SUBAGENT_MUX: "cmux" }, // cmux pinned, no CMUX_SOCKET_PATH -> unavailable
+    );
+    assert.equal(result.details.error, "mux not available");
+    assert.match(
+      result.content[0].text,
+      /Subagents require a supported terminal multiplexer/,
+    );
+  });
+
+  it("subagent_message reports how to target a live or ended subagent", async () => {
+    const result = await executeTool("subagent_message", { message: "hello" });
+    assert.equal(result.details.error, "no target");
+    assert.match(result.content[0].text, /No live subagent matched/);
+    assert.match(result.content[0].text, /sessionFile/);
+  });
+
+  it("subagent_interrupt demands a target", async () => {
+    const result = await executeTool("subagent_interrupt", {});
+    assert.match(
+      result.content[0].text,
+      /Provide a running subagent id or exact display name/,
+    );
+  });
+
+  it("subagent_interrupt reports an unknown id", async () => {
+    const result = await executeTool("subagent_interrupt", { id: "nope" });
+    assert.match(result.content[0].text, /No running subagent with id "nope"/);
+  });
+
+  it("subagent_close reports an unknown name", async () => {
+    const result = await executeTool("subagent_close", { name: "ghost" });
+    assert.match(result.content[0].text, /No running subagent named "ghost"/);
+  });
+
+  it("subagent_result renderer shows the summary and live-reply hint", () => {
+    const mock = boot();
+    const entry = mock.registeredMessageRenderers.find(
+      (e) => e.name === "subagent_result",
+    );
+    assert.ok(entry, "expected subagent_result renderer");
+    const rendered = entry
+      .renderer(
+        {
+          customType: "subagent_result",
+          content:
+            'Sub-agent "worker" completed (42s).\n\nAll done.\n\n' +
+            "Session: /tmp/session.jsonl\n" +
+            "Resume: pi --session /tmp/session.jsonl",
+          details: {
+            name: "worker",
+            task: "write tests",
+            elapsed: 42,
+            sessionFile: "/tmp/session.jsonl",
+            deliveredVia: "waiting",
+          },
+        },
+        { expanded: true },
+        theme,
+      )
+      .render(80)
+      .join("\n");
+    assert.match(rendered, /worker/);
+    assert.match(rendered, /completed \(42s\)/);
+    assert.match(rendered, /All done\./);
+    assert.doesNotMatch(rendered, /Resume: pi --session/);
+  });
+
+  it("subagent_ping renderer shows the ping question", () => {
+    const mock = boot();
+    const entry = mock.registeredMessageRenderers.find(
+      (e) => e.name === "subagent_ping",
+    );
+    assert.ok(entry, "expected subagent_ping renderer");
+    const rendered = entry
+      .renderer(
+        {
+          customType: "subagent_ping",
+          details: { name: "scout", message: "Which API should I use?" },
+        },
+        { expanded: true },
+        theme,
+      )
+      .render(80)
+      .join("\n");
+    assert.match(rendered, /scout/);
+    assert.match(rendered, /Which API should I use\?/);
   });
 });
 
