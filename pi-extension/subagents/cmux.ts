@@ -1029,6 +1029,27 @@ export interface GridRect {
   height: number;
 }
 
+/**
+ * Smallest rectangle covering every input rect. The one bounding fold behind
+ * both backends' group regions: callers always seed it with the parent pane's
+ * rect, so a solo parent yields exactly its own rect (the whole tab only when
+ * nothing else is in it). Input is never empty in practice; the Infinity
+ * edges of an empty fold are garbage by contract.
+ */
+function boundingRect(rects: GridRect[]): GridRect {
+  let left = Infinity;
+  let top = Infinity;
+  let right = -Infinity;
+  let bottom = -Infinity;
+  for (const rect of rects) {
+    left = Math.min(left, rect.x);
+    top = Math.min(top, rect.y);
+    right = Math.max(right, rect.x + rect.width);
+    bottom = Math.max(bottom, rect.y + rect.height);
+  }
+  return { x: left, y: top, width: right - left, height: bottom - top };
+}
+
 export interface GridDims {
   cols: number;
   rows: number;
@@ -1802,10 +1823,10 @@ function rightmostHerdrAnchor(
 /**
  * The region this agent group owns: the bounding rect of the parent pane and
  * its tracked subagent panes present in the layout. When the tab is shared
- * with unrelated panes (another agent, user panes), the group only claims
- * the parent's own panel — subagents split within it and rebalancing never
- * moves panes outside it. For a solo parent the region is the whole tab, so
- * the layout math is unchanged.
+ * with foreign panes (another agent, user splits), the group only claims the
+ * parent's own panel — subagents split within it and rebalancing never moves
+ * panes outside it. A solo parent's region is exactly its own rect; in an
+ * unshared tab that is the whole tab, so the layout math is unchanged.
  */
 function herdrGroupRegion(
   layout: HerdrLayout,
@@ -1813,32 +1834,37 @@ function herdrGroupRegion(
   trackedPaneIds?: string[],
 ): HerdrRect {
   const tracked = new Set(trackedPaneIds ?? herdrSubagentPaneList());
-  const region: HerdrRect = { ...parent.rect };
-  for (const pane of layout.panes) {
-    if (!tracked.has(pane.pane_id)) continue;
-    const right = pane.rect.x + pane.rect.width;
-    const bottom = pane.rect.y + pane.rect.height;
-    region.x = Math.min(region.x, pane.rect.x);
-    region.y = Math.min(region.y, pane.rect.y);
-    region.width = Math.max(region.x + region.width, right) - region.x;
-    region.height = Math.max(region.y + region.height, bottom) - region.y;
-  }
-  return region;
+  return boundingRect([
+    parent.rect,
+    ...layout.panes
+      .filter((pane) => tracked.has(pane.pane_id))
+      .map((pane) => pane.rect),
+  ]);
 }
 
-/** Subagent region: right of the parent, within the group's own region. */
+/**
+ * The subagent area a tiled spawn carves from: the group region minus the
+ * parent strip — right of the parent, within the group's own region, so a
+ * shared-tab spawn never reaches into foreign panes.
+ */
+function subagentArea(group: GridRect, parentRight: number): GridRect {
+  return {
+    x: parentRight,
+    y: group.y,
+    width: group.x + group.width - parentRight,
+    height: group.height,
+  };
+}
+
+/** Subagent area for herdr: right of the parent, inside the group region. */
 function herdrSubagentRegion(
   layout: HerdrLayout,
   parent: HerdrLayoutPane,
 ): HerdrRect {
-  const region = herdrGroupRegion(layout, parent);
-  const parentRight = parent.rect.x + parent.rect.width;
-  return {
-    x: parentRight,
-    y: region.y,
-    width: region.x + region.width - parentRight,
-    height: region.height,
-  };
+  return subagentArea(
+    herdrGroupRegion(layout, parent),
+    parent.rect.x + parent.rect.width,
+  );
 }
 
 /**
@@ -2119,40 +2145,42 @@ export interface TmuxResizeOp {
   width: number;
 }
 
-/**
- * Plan absolute-width resizes: parent at `parentRatio` of the group region,
- * every tracked full-height pane to its right sharing the rest equally.
- * Pure — no CLI calls.
- */
+/** A pane's geometry as a window-relative rect. */
+function tmuxPaneRect(pane: TmuxPaneGeometry): GridRect {
+  return {
+    x: pane.left,
+    y: pane.top,
+    width: pane.width,
+    height: pane.height,
+  };
+}
+
 /**
  * The region this agent group owns: the bounding rect (window-relative) of
- * the parent pane and its tracked subagent panes. Panes outside it (another
- * agent, user panes) are never measured, split, or resized.
+ * the parent pane and its tracked subagent panes. Foreign panes (another
+ * agent, user splits) are never measured into it, split, or resized.
  */
 function tmuxGroupRegion(
   panes: TmuxPaneGeometry[],
-  parentPaneId: string,
+  parent: TmuxPaneGeometry,
   trackedPaneIds?: string[],
-): GridRect | null {
-  const parent = panes.find((pane) => pane.paneId === parentPaneId);
-  if (!parent) return null;
+): GridRect {
   const tracked = new Set(trackedPaneIds ?? tmuxSubagentPaneList());
-  const region: GridRect = {
-    x: parent.left,
-    y: parent.top,
-    width: parent.width,
-    height: parent.height,
-  };
-  for (const pane of panes) {
-    if (!tracked.has(pane.paneId)) continue;
-    const right = pane.left + pane.width;
-    const bottom = pane.top + pane.height;
-    region.x = Math.min(region.x, pane.left);
-    region.y = Math.min(region.y, pane.top);
-    region.width = Math.max(region.x + region.width, right) - region.x;
-    region.height = Math.max(region.y + region.height, bottom) - region.y;
-  }
-  return region;
+  return boundingRect([
+    tmuxPaneRect(parent),
+    ...panes.filter((pane) => tracked.has(pane.paneId)).map(tmuxPaneRect),
+  ]);
+}
+
+/** Subagent area for tmux: right of the parent, inside the group region. */
+function tmuxSubagentRegion(
+  panes: TmuxPaneGeometry[],
+  parent: TmuxPaneGeometry,
+): GridRect {
+  return subagentArea(
+    tmuxGroupRegion(panes, parent),
+    parent.left + parent.width,
+  );
 }
 
 /** Containment check for tmux pane geometry against a region rect. */
@@ -2182,8 +2210,8 @@ function tmuxColumnLayout(
 } | null {
   const parent = panes.find((pane) => pane.paneId === parentPaneId);
   if (!parent) return null;
-  const region = tmuxGroupRegion(panes, parentPaneId, trackedPaneIds);
-  if (!region || !(region.width > 0)) return null;
+  const region = tmuxGroupRegion(panes, parent, trackedPaneIds);
+  if (!(region.width > 0)) return null;
 
   const tracked = new Set(trackedPaneIds ?? tmuxSubagentPaneList());
   const parentRight = parent.left + parent.width;
@@ -2220,6 +2248,13 @@ function tmuxWidthOp(
   return { paneId, width: target };
 }
 
+/**
+ * Plan absolute-width resizes that lay the group region out as: parent at
+ * `parentRatio` of the region on the left, every tracked full-height pane to
+ * its right sharing the rest equally. `trackedPaneIds` defaults to the
+ * process's tracked tmux panes. Returns no ops when the layout cannot be
+ * balanced (see tmuxColumnLayout). Pure — no CLI calls.
+ */
 export function planTmuxRebalance(
   panes: TmuxPaneGeometry[],
   parentPaneId: string,
@@ -2341,10 +2376,10 @@ export function planTmuxGridRebalance(
   const tracked = trackedPaneIds.filter((id) =>
     panes.some((pane) => pane.paneId === id),
   );
-  // The group's own region: parent + tracked panes, never the whole window
-  // when the tab is shared with unrelated panes.
-  const region = tmuxGroupRegion(panes, parentPaneId, tracked);
-  if (!region || !(region.width > 0) || !(region.height > 0)) return [];
+  // The group's own region: parent + tracked panes — never the whole window
+  // when the tab is shared with foreign panes.
+  const region = tmuxGroupRegion(panes, parent, tracked);
+  if (!(region.width > 0) || !(region.height > 0)) return [];
   if (!(parent.width > 0)) return [];
 
   // Unmanaged panes inside the group region (user splits) — leave the layout
@@ -2498,22 +2533,9 @@ function createTmuxSubagentSurface(name: string): string {
                 : [];
             })
           : [];
-        const parentRight = parent.left + parent.width;
-        // Subagent region: right of the parent, inside the group's own panel.
-        const group = tmuxGroupRegion(panes, parentPaneId, tracked);
-        const region: GridRect = group
-          ? {
-              x: parentRight,
-              y: group.y,
-              width: group.x + group.width - parentRight,
-              height: group.height,
-            }
-          : {
-              x: parentRight,
-              y: 0,
-              width: parent.windowWidth - parentRight,
-              height: parent.windowHeight,
-            };
+        // Subagent area: right of the parent, clipped to the group region so
+        // a shared-tab spawn never lands in a foreign pane.
+        const region = tmuxSubagentRegion(panes, parent);
         const selection =
           placed.length > 0
             ? selectTiledGridAnchor(placed, region, tracked.length + 1)
