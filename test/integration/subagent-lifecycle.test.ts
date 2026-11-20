@@ -19,6 +19,7 @@
 
 import assert from "node:assert/strict";
 import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import {
   cleanupTestEnv,
@@ -28,7 +29,9 @@ import {
   PI_TIMEOUT,
   readScreen,
   restoreBackend,
+  sendCommand,
   setBackend,
+  shellEscape,
   sleep,
   startPi,
   type TestEnv,
@@ -333,6 +336,53 @@ for (const backend of backends) {
         /needs help|PING/i.test(screen),
         `Screen should show ping notification. Got:\n${screen.slice(-800)}`,
       );
+    });
+
+    // ── Waiting-delivery lane (run ends without exiting) ──
+
+    it("delivers a finished run via waiting, then closes on demand", async () => {
+      const id = uniqueId();
+      const markerFile = `/tmp/pi-integ-idle-${id}.txt`;
+      trackTempFile(env, markerFile);
+
+      const surface = createTrackedSurface(env, `idle-${id}`);
+      await sleep(1000);
+
+      const parentSession = join(env.dir, `parent-idle-${id}.jsonl`);
+      const task = [
+        `Call the subagent tool with these EXACT parameters:`,
+        `  name: "Idle-${id}"`,
+        `  agent: "test-idle"`,
+        `  task: "Run this bash command: echo 'IDLE_PASS_${id}' > '${markerFile}'"`,
+        `Do not do anything else. Just call the subagent tool once.`,
+        `When you later receive the subagent's result, say INTEGRATION_COMPLETE.`,
+      ].join("\n");
+
+      startPi(surface, env.dir, task, {
+        extraArgs: `--session ${shellEscape(parentSession)}`,
+      });
+
+      // The test-idle agent finishes its run, asks a follow-up question, and
+      // WAITS — it never exits. The waiting-delivery lane must steer the
+      // closing message back after the 3s debounce: the parent session file
+      // gets a subagent_result custom message with deliveredVia "waiting".
+      const content = await waitForFile(markerFile, PI_TIMEOUT, /IDLE_PASS/);
+      assert.ok(content.includes(`IDLE_PASS_${id}`));
+
+      await waitForFile(
+        parentSession,
+        PI_TIMEOUT,
+        /"customType":"subagent_result"[\s\S]*"deliveredVia":"waiting"/,
+      );
+
+      // The pane must still exist and the run stay tracked: instruct the
+      // parent to close it explicitly via subagent_close.
+      sendCommand(
+        surface,
+        `Call the subagent_close tool with name "Idle-${id}". After it returns, reply with exactly: CLOSED_OK`,
+      );
+
+      await waitForFile(parentSession, PI_TIMEOUT, /CLOSED_OK|subagent_close/);
     });
 
     // ── Agent discovery ──

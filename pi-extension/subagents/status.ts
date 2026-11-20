@@ -30,7 +30,28 @@ export type StatusActivityPhase = "starting" | "active" | "waiting" | "done";
 export interface StatusConfig {
   enabled: boolean;
   lineLimit: number;
+  completion: CompletionConfig;
 }
+
+/**
+ * Completion-delivery tuning for the supervision interval.
+ *
+ * `steerDebounceMs` — how long an autonomous subagent must sit idle in its
+ * `waiting`/`done` phase before its closing message is steered to the parent
+ * without waiting for process exit.
+ *
+ * `idleCloseMs` — how long a delivered run may stay idle before the parent
+ * closes its pane. `0` disables idle auto-close.
+ */
+export interface CompletionConfig {
+  steerDebounceMs: number;
+  idleCloseMs: number;
+}
+
+export const DEFAULT_COMPLETION_CONFIG: CompletionConfig = {
+  steerDebounceMs: 3_000,
+  idleCloseMs: 600_000,
+};
 
 export type StatusObservation =
   | {
@@ -136,6 +157,48 @@ function rejectUnsupportedKeys(
   }
 }
 
+function requireInteger(
+  value: unknown,
+  source: string,
+  fieldName: string,
+  min: number,
+): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value < min) {
+    invalidStatusConfig(source, `${fieldName} must be an integer >= ${min}`);
+  }
+  return value;
+}
+
+function parseCompletionConfig(raw: unknown, source: string): CompletionConfig {
+  if (raw == null) return { ...DEFAULT_COMPLETION_CONFIG };
+  const completion = requireObject(raw, source, "completion");
+  rejectUnsupportedKeys(
+    completion,
+    ["steerDebounceMs", "idleCloseMs"],
+    source,
+    "completion",
+  );
+  const steerDebounceMs =
+    completion.steerDebounceMs === undefined
+      ? DEFAULT_COMPLETION_CONFIG.steerDebounceMs
+      : requireInteger(
+          completion.steerDebounceMs,
+          source,
+          "completion.steerDebounceMs",
+          1,
+        );
+  const idleCloseMs =
+    completion.idleCloseMs === undefined
+      ? DEFAULT_COMPLETION_CONFIG.idleCloseMs
+      : requireInteger(
+          completion.idleCloseMs,
+          source,
+          "completion.idleCloseMs",
+          0,
+        );
+  return { steerDebounceMs, idleCloseMs };
+}
+
 function truncateText(text: string, maxLength: number): string {
   if (text.length <= maxLength) return text;
   if (maxLength <= 1) return text.slice(0, maxLength);
@@ -158,7 +221,13 @@ function snapshotProblemLabel(
   return null;
 }
 
-function activityLabel(
+/**
+ * Resolve the display label for what a subagent is doing right now: the
+ * activity snapshot's own label if present, else its coarse scope.
+ * (Named resolve* to avoid colliding with the StatusSnapshot.activityLabel
+ * field it reads, and with index.ts's activityLabel over SubagentActivityState.)
+ */
+function resolveActivityLabel(
   snapshot: Pick<StatusSnapshot, "activityLabel" | "activeScope">,
 ): string | null {
   return snapshot.activityLabel ?? snapshot.activeScope;
@@ -172,10 +241,12 @@ export function parseStatusConfig(
   const status = requireObject(config.status, source, "status");
   rejectUnsupportedKeys(status, ["enabled"], source, "status");
   const enabled = requireBoolean(status.enabled, source, "status.enabled");
+  const completion = parseCompletionConfig(config.completion, source);
 
   return {
     enabled,
     lineLimit: DEFAULT_STATUS_LINE_LIMIT,
+    completion,
   };
 }
 
@@ -288,6 +359,10 @@ export function observeStatus(
   const sequence = observation.sequence;
   const lastActivityAtMs = state.lastActivityAtMs;
   const lastActivitySequence = state.lastActivitySequence;
+  // Drop observations older than the last accepted one (timestamp first,
+  // sequence as tiebreaker) — late-arriving writes must not rewind state.
+  // Equal timestamp + equal sequence is accepted: an identical re-observation
+  // is not stale.
   const olderThanLastActivity =
     lastActivityAtMs != null &&
     (updatedAt < lastActivityAtMs ||
@@ -296,6 +371,10 @@ export function observeStatus(
         sequence < lastActivitySequence));
   if (olderThanLastActivity) return state;
 
+  // Same monotonicity guard against the interrupt's local override. The
+  // override recorded its own sequence, so an observation at exactly
+  // (overrideAtMs, overrideSequence) is the override itself echoing back —
+  // only a strictly bumped sequence is fresh. Hence <= here vs < above.
   const blockedByLocalOverride =
     state.localOverrideAtMs != null &&
     (updatedAt < state.localOverrideAtMs ||
@@ -380,6 +459,9 @@ function classifyProblemState(
   if (problemMs >= SNAPSHOT_STALLED_AFTER_MS)
     return { kind: "stalled", statusLabel: problemLabel };
 
+  // Last healthy state to fall back to while a problem is in its grace
+  // period: prefer active, then waiting/done, then starting (stalled is never
+  // reported as healthy), else whatever the current kind was.
   const lastHealthyKind = state.activeNow
     ? "active"
     : state.waitingSinceMs != null || state.phase === "done"
@@ -501,7 +583,7 @@ export function advanceStatusState(
 }
 
 function formatActiveDetail(snapshot: StatusSnapshot): string {
-  const label = activityLabel(snapshot);
+  const label = resolveActivityLabel(snapshot);
   if (!label) return "active";
   const duration = snapshot.activeDurationText
     ? ` ${snapshot.activeDurationText}`
@@ -523,6 +605,10 @@ function formatStalledDetail(snapshot: StatusSnapshot): string {
     : "";
   return `stalled${duration}${detail}`;
 }
+
+// NOTE: index.ts's formatWidgetRightLabel re-implements a compact variant of
+// these detail formatters for the widget's right edge — keep the wording in
+// sync when changing the labels here.
 
 export function formatStatusLine(
   name: string,
@@ -548,12 +634,7 @@ export function formatStatusLine(
   }
 
   if (snapshot.kind === "waiting") {
-    const problem =
-      snapshot.statusLabel && snapshot.statusLabel !== "done"
-        ? ` (${snapshot.statusLabel})`
-        : snapshot.statusLabel === "done"
-          ? " (done)"
-          : "";
+    const problem = snapshot.statusLabel ? ` (${snapshot.statusLabel})` : "";
     return boundStatusLine(
       `${boundedName} running ${snapshot.elapsedText}, ${formatWaitingDetail(snapshot)}${problem}.`,
     );

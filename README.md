@@ -77,14 +77,15 @@ cmux, zellij, and WezTerm keep their own layout behavior regardless of this sett
 
 ### Extensions
 
-**Subagents** — 4 main-session tools + 3 commands, plus 1 subagent-only tool:
+**Subagents** — 5 main-session tools + 3 commands, plus 1 subagent-only tool:
 
 | Tool                 | Description                                                                                 |
 | -------------------- | ------------------------------------------------------------------------------------------- |
 | `subagent`           | Spawn a sub-agent in a dedicated multiplexer pane (async — returns immediately)             |
 | `subagent_interrupt` | Interrupt a running Pi-backed subagent's current turn                                       |
+| `subagent_message`   | Message a live subagent (typed into its pane) or resume an ended session (async)            |
+| `subagent_close`     | Close a running subagent's pane and finish its session                                      |
 | `subagents_list`     | List available agent definitions                                                            |
-| `subagent_resume`    | Resume a previous sub-agent session (async)                                                 |
 
 | Command                    | Description                          |
 | -------------------------- | ------------------------------------ |
@@ -128,6 +129,16 @@ Multiple subagents run concurrently — each steers its result back independentl
 
 Completion messages render with a colored background and are expandable with `Ctrl+O` to show the full summary and session file path.
 
+### Waiting-delivery for autonomous subagents
+
+Autonomous (non-interactive) Pi-backed subagents keep their pane alive after a run finishes. These spawns are told to simply end their turn with a summary (delivery is automatic), and if a child still sits idle in its `waiting`/`done` phase for `completion.steerDebounceMs` (default 3s) without exiting — e.g. an agent that ignores those instructions or was interrupted mid-flow — the parent steers the run's closing message back instead of waiting forever for process exit:
+
+> Sub-agent "Worker" finished its run (2m 14s) — pane kept alive for follow-ups.
+
+The parent can then keep the conversation going live with `subagent_message` (the message is typed straight into the child's pane) and finish with `subagent_close` when done. After `completion.idleCloseMs` (default 10 minutes, `0` disables) of delivered-and-idle time, the pane is closed automatically. Each idle episode steers at most once; a follow-up message starts a new episode whose result is delivered when the child goes idle again.
+
+Auto-exit agents are unaffected: they exit within ~1s of finishing, so the normal exit path always wins. Interactive spawns (planner, `/iterate` forks) never enter this lane — the user drives those panes directly.
+
 ### In-progress status updates
 
 The widget tracks each Pi-backed sub-agent from a child-written runtime snapshot and labels it with a coarse state:
@@ -144,7 +155,7 @@ These labels are no longer derived from session-file growth. Session JSONL is st
 
 #### Configuration
 
-Status display is controlled by `config.json` in the extension directory. Copy `config.json.example` to get started:
+Status display and completion delivery are controlled by `config.json` in the extension directory. Copy `config.json.example` to get started:
 
 ```bash
 cp config.json.example config.json
@@ -154,11 +165,19 @@ cp config.json.example config.json
 {
   "status": {
     "enabled": true
+  },
+  "completion": {
+    "steerDebounceMs": 3000,
+    "idleCloseMs": 600000
   }
 }
 ```
 
-`config.json` is gitignored so local overrides don't get committed.
+- `status.enabled` — show the live status widget and steer `stalled`/`recovered` transitions.
+- `completion.steerDebounceMs` — how long an autonomous subagent must sit idle after finishing a run before its closing message is steered to the parent (default `3000`, minimum `1`). There is no disable switch for the lane itself — spawns that should never be waiting-delivered should be interactive (default for user-driven agents) or auto-exit.
+- `completion.idleCloseMs` — how long a delivered run may stay idle before its pane is closed automatically (default `600000` = 10 minutes; `0` disables idle auto-close). Applies only to autonomous spawns whose result was already delivered.
+
+Completion supervision runs even with the status widget disabled. `config.json` is gitignored so local overrides don't get committed.
 
 ---
 
@@ -207,30 +226,70 @@ subagent_interrupt({ name: "Scout" });
 
 This sends Escape to the child pane, cancelling the in-progress model turn. The subagent session stays alive — the pane, session file, and background polling all remain intact. After the interrupt, the widget immediately moves the child back to `waiting`, and stale pre-interrupt snapshots are ignored. If the child starts work later, newer snapshots return it to `active`; completion, failure, and `caller_ping` still flow through normally.
 
-This is a turn-level interrupt, not a method for forcibly terminating a subagent session.
+This is a turn-level interrupt, not a method for forcibly terminating a subagent session. Interrupted runs are excluded from waiting-delivery and idle auto-close — the pane stays alive for the user.
 
 > **Note:** Only Pi-backed subagents are supported. Claude-backed runs will return an error.
 
 ---
 
+## Messaging a subagent (live or ended)
+
+`subagent_message` is the single entry point for follow-ups:
+
+```typescript
+// Live subagent — the message is typed into its pane, like a user typing.
+// Works while the child is mid-run too (pi queues input); no busy-gating.
+subagent_message({ name: "Scout", message: "Also check the auth middleware" });
+subagent_message({ id: "abcd1234", message: "Focus on the failing test" });
+
+// Ended session — resumes it in a new pane with the message as follow-up
+// (fire-and-forget: the result arrives later as a steer message).
+subagent_message({
+  sessionFile: "/home/…/sessions/…/2026-…jsonl",
+  message: "One more pass on the edge cases",
+});
+```
+
+**`subagent_message` parameters:**
+- `message` (required): The message to deliver
+- `name` (optional): Display name of a live subagent (also used as tab label on resume)
+- `id` (optional): Live subagent id (from the spawn tool result details)
+- `sessionFile` (optional): Session `.jsonl` path — **required when the target is not live**. Found in the result steer message details / the `Session:` line.
+- `autoExit` (optional, resume path only): Whether the resumed session should auto-exit after its next response. Defaults to `true` for autonomous follow-up work; set `false` for an interactive handoff.
+
+When a live name matches multiple running subagents, the tool returns an ambiguity error listing the candidates.
+
+### Closing a subagent
+
+Use `subagent_close` to close a live pane and finish its session — e.g. after following up on a waiting-delivery result, or to clean up a subagent that is no longer needed:
+
+```typescript
+subagent_close({ name: "Scout" });
+subagent_close({ id: "abcd1234" });
+```
+
+If the run's result was not already delivered (waiting-delivery lane), it still arrives as an automatic steer message when the pane closes.
+
+---
+
 ## caller_ping — Child-to-Parent Help Request
 
-The `caller_ping` tool lets a subagent request help from its parent agent. When called, the child session **exits** and the parent receives a notification with the help message. The parent can then **resume** the child session with a response using `subagent_resume`.
+The `caller_ping` tool lets a subagent request help from its parent agent. When called, the child session **exits** and the parent receives a notification with the help message. The parent can then **resume** the child session with a response using `subagent_message` (with `sessionFile`).
 
 **`caller_ping` parameters:**
 - `message` (required): What you need help with
 
-**`subagent_resume` parameters:**
-- `sessionPath` (required): Path to the child session `.jsonl` file
+**`subagent_message` resume parameters:**
+- `sessionFile` (required): Path to the child session `.jsonl` file
 - `name` (optional): Display name for the resumed pane (defaults to `Resume`)
-- `message` (optional): Follow-up prompt to send after resuming
+- `message` (required): Follow-up prompt to send after resuming
 - `autoExit` (optional): Whether the resumed session should auto-exit after its next response. Defaults to `true` for autonomous follow-up work; set `false` when resuming for an interactive handoff.
 
 **Interaction flow:**
 1. Child calls `caller_ping({ message: "Not sure which schema to use" })`
 2. Child session exits (like `subagent_done`)
 3. Parent receives a steer notification: *"Sub-agent Worker needs help: Not sure which schema to use"*
-4. Parent resumes the child session via `subagent_resume` with the response
+4. Parent resumes the child session via `subagent_message` with the response
 5. Child picks up where it left off with the parent's guidance
 
 **Example:**
@@ -353,7 +412,8 @@ When set to `true`, the agent session shuts down automatically as soon as the ag
 
 - The session closes after the agent's final message (on the `agent_end` event)
 - If the user sends **any input** before the agent finishes, auto-exit is permanently disabled for that session — the user takes over interactively
-- The modeHint injected into the agent's task is adjusted accordingly: autonomous agents see "Complete your task autonomously." rather than instructions to call `subagent_done`
+- The modeHint injected into the agent's task is adjusted accordingly: autonomous agents see "Complete your task autonomously." rather than instructions to call `subagent_done`. Autonomous non-auto-exit spawns (no `auto-exit`, `interactive: false`) get a third variant: end your turn with a summary — the waiting-delivery lane picks it up automatically, so they are told NOT to call `subagent_done`.
+- **Credential fallback**: if the agent's model resolves to a provider with no configured credentials on the spawning machine (e.g. a hardcoded `anthropic/*` model without an Anthropic login), the launch falls back to the parent session's current model and the spawn result carries a `modelWarning` — instead of spawning a child that dies at startup with "No API key found". The agent's `thinking` level is dropped on fallback (it may not be valid on the parent's model). Claude-backed launches are exempt (the claude CLI manages its own auth).
 
 **When to use:**
 
@@ -401,7 +461,7 @@ By default, every sub-agent can spawn further sub-agents. Control this with fron
 
 ### `spawning: false`
 
-Denies all subagent lifecycle tools (`subagent`, `subagent_interrupt`, `subagents_list`, `subagent_resume`):
+Denies all subagent lifecycle tools (`subagent`, `subagent_interrupt`, `subagent_message`, `subagent_close`, `subagents_list`):
 
 ```yaml
 ---

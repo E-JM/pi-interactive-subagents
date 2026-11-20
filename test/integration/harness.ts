@@ -2,7 +2,7 @@
  * Integration test harness for pi-interactive-subagents.
  *
  * Provides utilities to:
- * - Detect available mux backends (cmux, tmux, zellij, herdr)
+ * - Detect available mux backends (cmux, tmux, zellij, wezterm, herdr)
  * - Create isolated test environments with test agent definitions
  * - Start real pi sessions in mux surfaces
  * - Poll for file creation and screen output
@@ -33,14 +33,11 @@ import {
   parseCmuxPaneRefForSurfaceFromJson,
   readScreen,
   readScreenAsync,
-  sendCommand,
-  sendEscape,
   sendLongCommand,
   shellEscape,
 } from "../../pi-extension/subagents/cmux.ts";
 
-export type { MuxBackend };
-// Re-export mux primitives for tests
+// Re-export mux primitives for tests (single source of truth: cmux.ts).
 export {
   closeSurface,
   createSurface,
@@ -51,7 +48,8 @@ export {
   sendEscape,
   sendLongCommand,
   shellEscape,
-};
+} from "../../pi-extension/subagents/cmux.ts";
+export type { MuxBackend };
 
 // ── Paths ──
 
@@ -86,7 +84,23 @@ export const TEST_MODEL =
 /** Per-test timeout in ms. Override with PI_TEST_TIMEOUT env var. */
 export const PI_TIMEOUT = Number(process.env.PI_TEST_TIMEOUT ?? "120000");
 
+// ── Polling cadence ──
+
+/** Fast poll for quick-changing local state (e.g. focus transitions). */
+const POLL_INTERVAL_FAST_MS = 200;
+/** Slow poll for subprocess output — mux screen reads are expensive. */
+const POLL_INTERVAL_SLOW_MS = 2000;
+
 // ── Backend detection ──
+
+/** All supported backends — keep in sync with cmux.ts's MuxBackend union. */
+const ALL_BACKENDS: MuxBackend[] = [
+  "cmux",
+  "tmux",
+  "zellij",
+  "wezterm",
+  "herdr",
+];
 
 /**
  * Detect which mux backends are actually available in the current environment.
@@ -96,7 +110,7 @@ export function getAvailableBackends(): MuxBackend[] {
   const backends: MuxBackend[] = [];
   const orig = process.env.PI_SUBAGENT_MUX;
 
-  for (const backend of ["cmux", "tmux", "zellij", "herdr"] as MuxBackend[]) {
+  for (const backend of ALL_BACKENDS) {
     process.env.PI_SUBAGENT_MUX = backend;
     try {
       if (getMuxBackend() === backend) backends.push(backend);
@@ -154,9 +168,11 @@ export function getFocusedSurface(backend: MuxBackend): string | null {
       const output = execFileSync("herdr", ["pane", "list"], {
         encoding: "utf8",
       });
-      const panes = JSON.parse(output)?.result?.panes;
+      const panes = JSON.parse(output)?.result?.panes as
+        | { pane_id?: string; focused?: boolean }[]
+        | undefined;
       if (!Array.isArray(panes)) return null;
-      const focused = panes.find((pane: any) => pane?.focused === true);
+      const focused = panes.find((pane) => pane?.focused === true);
       return focused?.pane_id ?? null;
     } catch {
       return null;
@@ -206,7 +222,7 @@ export async function waitForFocusedSurface(
   const start = Date.now();
   while (Date.now() - start < timeout) {
     if (getFocusedSurface(backend) === surface) return;
-    await sleep(200);
+    await sleep(POLL_INTERVAL_FAST_MS);
   }
 
   throw new Error(
@@ -317,9 +333,6 @@ export function untrackSurface(env: TestEnv, surface: string): void {
 /**
  * Start a pi session in a mux surface with the subagents extension loaded.
  * Returns immediately — the pi process runs asynchronously in the surface.
- *
- * The command ends with a sentinel so we can detect when pi exits:
- *   `pi ...; echo '__TEST_DONE_'$?'__'`
  */
 export function startPi(
   surface: string,
@@ -334,10 +347,7 @@ export function startPi(
   // background panes, so screen-based assertions need regular mode there.
   const tuiMode = getMuxBackend() === "herdr" ? "--tui-mode regular" : "";
 
-  // Force pi to load the working-tree extension (not an installed pi-package
-  // snapshot). `-ne` disables extension auto-discovery, `-e <path>` loads the
-  // current branch's source directly. Without this, the tests silently run
-  // against whatever version is checked out under `~/.pi/agent/git/...`.
+  // Force-load the working-tree extension (see EXTENSION_SOURCE above).
   const cmd = [
     `cd ${shellEscape(testDir)} &&`,
     `pi`,
@@ -351,7 +361,7 @@ export function startPi(
     .filter(Boolean)
     .join(" ");
 
-  sendLongCommand(surface, `${cmd}; echo '__TEST_DONE_'$?'__'`, {
+  sendLongCommand(surface, cmd, {
     scriptPath: join(testDir, `test-launch-${Date.now()}.sh`),
   });
 }
@@ -374,7 +384,7 @@ export async function waitForScreen(
       const screen = await readScreenAsync(surface, lines);
       if (pattern.test(screen)) return screen;
     } catch {}
-    await sleep(2000);
+    await sleep(POLL_INTERVAL_SLOW_MS);
   }
 
   let finalScreen = "";
@@ -401,25 +411,12 @@ export async function waitForFile(
       const content = readFileSync(path, "utf8");
       if (!contentPattern || contentPattern.test(content)) return content;
     }
-    await sleep(2000);
+    await sleep(POLL_INTERVAL_SLOW_MS);
   }
   throw new Error(
     `Timeout (${timeout}ms) waiting for file: ${path}` +
       (contentPattern ? ` matching ${contentPattern}` : ""),
   );
-}
-
-/**
- * Wait for the pi process in a surface to exit (sentinel detection).
- * Returns the exit code.
- */
-export async function waitForPiExit(
-  surface: string,
-  timeout: number = PI_TIMEOUT,
-): Promise<number> {
-  const screen = await waitForScreen(surface, /__TEST_DONE_(\d+)__/, timeout);
-  const match = screen.match(/__TEST_DONE_(\d+)__/);
-  return match ? parseInt(match[1], 10) : -1;
 }
 
 // ── Utilities ──

@@ -63,12 +63,12 @@ export type ActivityReadResult =
   | { ok: true; activity: SubagentActivityState }
   | { ok: false; reason: "missing" | "invalid" | "wrong-id"; error?: string };
 
-export type SubagentShutdownReason =
-  | "quit"
-  | "reload"
-  | "new"
-  | "resume"
-  | "fork";
+/**
+ * Why the child session is shutting down. `"quit"` records a final done
+ * marker; `"reload"` (or no reason) only disables the recorder — a /reload
+ * keeps the process alive, so the activity file goes stale afterwards.
+ */
+export type SubagentShutdownReason = "quit" | "reload";
 
 export interface SubagentActivityRecorder {
   sessionStart(): void;
@@ -283,7 +283,11 @@ export function readSubagentActivityFile(
   return validateActivity(parsed, expectedRunningChildId);
 }
 
-export function writeSubagentActivityFile(
+/**
+ * Atomically write the activity snapshot (temp file + rename) so readers
+ * never observe a half-written file.
+ */
+function writeSubagentActivityFile(
   activityFile: string,
   activity: SubagentActivityState,
 ): void {
@@ -427,6 +431,9 @@ export function createSubagentActivityRecorder(params: {
       lastFlushAt = now();
       failureCount = 0;
     } catch {
+      // Intentionally swallowed per attempt (throttle backpressure) — only
+      // after MAX_WRITE_FAILURES consecutive failures does the recorder
+      // disable itself.
       failureCount += 1;
       if (failureCount >= MAX_WRITE_FAILURES) disable();
     }
@@ -537,6 +544,10 @@ export function createSubagentActivityRecorder(params: {
           current.agentActive = true;
           current.turnActive = true;
           if (turnIndex != null) current.turnIndex = turnIndex;
+          // Preserve a more-specific tool/provider scope instead of
+          // downgrading to "turn": turn_start fires while a tool or provider
+          // call from the previous turn may still be winding down, and the
+          // widget should not flash a generic "running" label mid-tool.
           markActive(
             current,
             current.toolActive || current.providerActive

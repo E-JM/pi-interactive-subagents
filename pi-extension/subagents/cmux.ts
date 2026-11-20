@@ -13,7 +13,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { dirname, join } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -22,6 +22,7 @@ export type MuxBackend = "cmux" | "tmux" | "zellij" | "wezterm" | "herdr";
 
 const commandAvailability = new Map<string, boolean>();
 
+/** Cached for the process lifetime; mux availability is not re-checked after startup. */
 function hasCommand(command: string): boolean {
   const cached = commandAvailability.get(command);
   if (cached !== undefined) return cached;
@@ -32,12 +33,7 @@ function hasCommand(command: string): boolean {
       execFileSync("where.exe", [command], { stdio: "ignore" });
       available = true;
     } catch {
-      try {
-        execSync(`command -v ${command}`, { stdio: "ignore" });
-        available = true;
-      } catch {
-        available = false;
-      }
+      available = false;
     }
   } else {
     try {
@@ -93,14 +89,6 @@ function isHerdrRuntimeAvailable(): boolean {
 
 export function isCmuxAvailable(): boolean {
   return isCmuxRuntimeAvailable();
-}
-
-export function isTmuxAvailable(): boolean {
-  return isTmuxRuntimeAvailable();
-}
-
-export function isZellijAvailable(): boolean {
-  return isZellijRuntimeAvailable();
 }
 
 export function isWezTermAvailable(): boolean {
@@ -164,22 +152,6 @@ function requireMuxBackend(): MuxBackend {
   return backend;
 }
 
-/**
- * Detect if the user's default shell is fish.
- * Fish uses $status instead of $? for exit codes.
- */
-export function isFishShell(): boolean {
-  const shell = process.env.SHELL ?? "";
-  return basename(shell) === "fish";
-}
-
-/**
- * Return the shell-appropriate exit status variable ($? for bash/zsh, $status for fish).
- */
-export function exitStatusVar(): string {
-  return isFishShell() ? "$status" : "$?";
-}
-
 export function shellEscape(s: string): string {
   return `'${s.replace(/'/g, "'\\''")}'`;
 }
@@ -214,7 +186,6 @@ const ZELLIJ_PANE_SCOPED_ACTIONS = new Set([
   "move-pane",
   "write",
   "write-chars",
-  "send-keys",
 ]);
 
 function zellijActionArgs(args: string[], surface?: string): string[] {
@@ -575,6 +546,7 @@ function withZellijSurfaceLock<T>(callback: () => T): T {
 
       try {
         if (Date.now() - statSync(lockPath).mtimeMs > 30000) {
+          // Stale lock — older than 30s means a crashed holder left it behind.
           rmSync(lockPath, { recursive: true, force: true });
           continue;
         }
@@ -1332,6 +1304,19 @@ export interface HerdrResizeOp {
  * split's ratio is targeted independently, so nesting depth doesn't matter.
  * Panes left of the parent or partial-height are frozen. Pure — no CLI calls.
  */
+/**
+ * True when `pane` lies (within a ±1.5 cell tolerance for float drift) fully
+ * inside `rect`. Shared by the columns and grid rebalance planners.
+ */
+function paneInRect(pane: HerdrLayoutPane, rect: HerdrRect): boolean {
+  return (
+    pane.rect.x >= rect.x - 1.5 &&
+    pane.rect.y >= rect.y - 1.5 &&
+    pane.rect.x + pane.rect.width <= rect.x + rect.width + 1.5 &&
+    pane.rect.y + pane.rect.height <= rect.y + rect.height + 1.5
+  );
+}
+
 export function planHerdrRebalance(
   layout: HerdrLayout,
   parentPaneId: string,
@@ -1379,12 +1364,6 @@ export function planHerdrRebalance(
     return pane.rect.width; // frozen
   };
 
-  const inRect = (pane: HerdrLayoutPane, rect: HerdrRect): boolean =>
-    pane.rect.x >= rect.x - 1.5 &&
-    pane.rect.y >= rect.y - 1.5 &&
-    pane.rect.x + pane.rect.width <= rect.x + rect.width + 1.5 &&
-    pane.rect.y + pane.rect.height <= rect.y + rect.height + 1.5;
-
   // Outermost splits first.
   const rightSplits = layout.splits.filter(
     (split) => split.direction === "right",
@@ -1415,8 +1394,12 @@ export function planHerdrRebalance(
       width: split.rect.x + split.rect.width - dividerX,
       height: split.rect.height,
     };
-    const leftLeaves = layout.panes.filter((pane) => inRect(pane, leftRect));
-    const rightLeaves = layout.panes.filter((pane) => inRect(pane, rightRect));
+    const leftLeaves = layout.panes.filter((pane) =>
+      paneInRect(pane, leftRect),
+    );
+    const rightLeaves = layout.panes.filter((pane) =>
+      paneInRect(pane, rightRect),
+    );
     if (leftLeaves.length === 0 || rightLeaves.length === 0) continue;
 
     const leftTarget = leftLeaves.reduce(
@@ -1524,7 +1507,6 @@ function planDividerOps(
   splits: HerdrLayoutSplit[],
   layout: HerdrLayout,
   targetRectOf: (pane: HerdrLayoutPane) => HerdrRect,
-  inRect: (pane: HerdrLayoutPane, rect: HerdrRect) => boolean,
 ): HerdrResizeOp[] {
   const ops: HerdrResizeOp[] = [];
   const targetExtentOf = (leaves: HerdrLayoutPane[]): number => {
@@ -1543,10 +1525,10 @@ function planDividerOps(
     const span = axis.size(split.rect);
     const divider = start + span * split.ratio;
     const lowLeaves = layout.panes.filter((pane) =>
-      inRect(pane, axis.subRect(split, start, divider - start)),
+      paneInRect(pane, axis.subRect(split, start, divider - start)),
     );
     const highLeaves = layout.panes.filter((pane) =>
-      inRect(pane, axis.subRect(split, divider, start + span - divider)),
+      paneInRect(pane, axis.subRect(split, divider, start + span - divider)),
     );
     if (lowLeaves.length === 0 || highLeaves.length === 0) continue;
 
@@ -1587,10 +1569,10 @@ function planDividerOps(
 
 /**
  * Plan resizes that lay the tab out as a tiled grid: parent at `parentRatio`
- * width on the left, tracked panes (fill order) in a ceil(sqrt(n)) ×
- * ceil(n/cols) grid of equal cells to its right. Handles both right-splits
- * (vertical dividers) and down-splits (horizontal dividers); untracked panes
- * are frozen. Pure — no CLI calls.
+ * width on the left, tracked panes (fill order) in the `gridDimsForCount`
+ * grid (round(sqrt(n)) rows × ceil(n/rows) columns) of equal cells to its
+ * right. Handles both right-splits (vertical dividers) and down-splits
+ * (horizontal dividers); untracked panes are frozen. Pure — no CLI calls.
  */
 export function planHerdrGridRebalance(
   layout: HerdrLayout,
@@ -1627,12 +1609,6 @@ export function planHerdrGridRebalance(
     return targets.cells.get(pane.pane_id) ?? pane.rect; // frozen when untracked
   };
 
-  const inRect = (pane: HerdrLayoutPane, rect: HerdrRect): boolean =>
-    pane.rect.x >= rect.x - 1.5 &&
-    pane.rect.y >= rect.y - 1.5 &&
-    pane.rect.x + pane.rect.width <= rect.x + rect.width + 1.5 &&
-    pane.rect.y + pane.rect.height <= rect.y + rect.height + 1.5;
-
   const byAreaDesc = (a: HerdrLayoutSplit, b: HerdrLayoutSplit): number =>
     b.rect.width * b.rect.height - a.rect.width * a.rect.height;
   const verticalDividers = layout.splits
@@ -1643,8 +1619,8 @@ export function planHerdrGridRebalance(
     .sort(byAreaDesc);
 
   ops.push(
-    ...planDividerOps(AXIS_X, verticalDividers, layout, targetRectOf, inRect),
-    ...planDividerOps(AXIS_Y, horizontalDividers, layout, targetRectOf, inRect),
+    ...planDividerOps(AXIS_X, verticalDividers, layout, targetRectOf),
+    ...planDividerOps(AXIS_Y, horizontalDividers, layout, targetRectOf),
   );
   return ops;
 }
@@ -1847,10 +1823,10 @@ function rebalanceHerdrLayoutForMode(parentPaneId: string): void {
 /**
  * Create a herdr subagent surface. In "columns" mode (default) the parent
  * keeps its width and new subagents split the rightmost subagent pane so all
- * subagent panes stay equal width. In "tiled" mode subagents fill a
- * ceil(sqrt(n)) × ceil(n/cols) grid right of the parent: each spawn splits
- * the pane covering the next grid cell (right/down) and the grid is
- * rebalanced afterwards.
+ * subagent panes stay equal width. In "tiled" mode subagents fill the
+ * gridDimsForCount grid (round(sqrt(n)) rows × ceil(n/rows) columns) right
+ * of the parent: each spawn splits the pane covering the next grid cell
+ * (right/down) and the grid is rebalanced afterwards.
  */
 function createHerdrSubagentSurface(name: string): string {
   const parentPaneId = process.env.HERDR_PANE_ID;
@@ -2238,10 +2214,10 @@ function rightmostTmuxAnchor(
 /**
  * Create a tmux subagent surface. In "columns" mode (default) the parent
  * keeps its width and new subagents split the rightmost subagent pane so all
- * subagent panes stay equal width. In "tiled" mode subagents fill a
- * ceil(sqrt(n)) × ceil(n/cols) grid right of the parent: each spawn splits
- * the pane covering the next grid cell (right/down) and the grid is
- * rebalanced afterwards.
+ * subagent panes stay equal width. In "tiled" mode subagents fill the
+ * gridDimsForCount grid (round(sqrt(n)) rows × ceil(n/rows) columns) right
+ * of the parent: each spawn splits the pane covering the next grid cell
+ * (right/down) and the grid is rebalanced afterwards.
  */
 function createTmuxSubagentSurface(name: string): string {
   const parentPaneId = process.env.TMUX_PANE;
@@ -2326,7 +2302,9 @@ function isHerdrAgentWorking(surface: string): Promise<boolean> {
  * For zellij: chooses a tab-aware tiled or stacked placement.
  * For herdr: splits the rightmost subagent pane (no focus steal), keeping the
  * parent pane at a fixed width, then rebalances so all subagent panes are
- * equally wide (`PI_SUBAGENT_HERDR_PARENT_RATIO`, default 0.4).
+ * equally wide (`PI_SUBAGENT_HERDR_PARENT_RATIO`, default 0.4). In "tiled"
+ * mode both herdr and tmux instead fill a grid right of the parent — see
+ * createHerdrSubagentSurface / createTmuxSubagentSurface.
  * For tmux: same balanced layout as herdr (`PI_SUBAGENT_TMUX_PARENT_RATIO`),
  * using absolute `resize-pane -x` widths.
  * For wezterm: falls back to split behavior.
@@ -2717,6 +2695,8 @@ export function sendCommand(surface: string, command: string): void {
   }
 
   zellijActionSync(["write-chars", command], surface);
+  // zellij "write" takes raw bytes — 13 = Enter (CR), the tmux/herdr
+  // equivalents send the named "Enter" key.
   zellijActionSync(["write", "13"], surface);
 }
 
@@ -2758,6 +2738,7 @@ export function sendEscape(surface: string): void {
     return;
   }
 
+  // 27 = Escape.
   zellijActionSync(["write", "27"], surface);
 }
 
@@ -2845,17 +2826,11 @@ export function readScreen(surface: string, lines = 50): string {
     return tailLines(raw, lines);
   }
 
-  // Zellij 0.44+: use --pane-id flag + stdout instead of env var + temp file.
-  // The ZELLIJ_PANE_ID env var doesn't reliably target other panes for dump-screen,
-  // and --path may silently fail to create the file. Stdout capture is robust.
-  const paneId = zellijPaneId(surface);
-  const raw = execFileSync(
-    "zellij",
-    ["action", "dump-screen", "--pane-id", paneId],
-    {
-      encoding: "utf8",
-    },
-  );
+  // Zellij 0.44+: dump-screen to stdout via --pane-id instead of env var +
+  // temp file. The ZELLIJ_PANE_ID env var doesn't reliably target other panes
+  // for dump-screen, and --path may silently fail to create the file. Stdout
+  // capture is robust.
+  const raw = zellijActionSync(["dump-screen"], surface);
   return tailLines(raw, lines);
 }
 
@@ -2906,11 +2881,10 @@ export async function readScreenAsync(
     return tailLines(stdout, lines);
   }
 
-  // Zellij 0.44+: use --pane-id flag + stdout instead of env var + temp file.
-  const paneId = zellijPaneId(surface);
+  // Zellij 0.44+: dump-screen to stdout via --pane-id (see readScreen).
   const { stdout } = await execFileAsync(
     "zellij",
-    ["action", "dump-screen", "--pane-id", paneId],
+    zellijActionArgs(["dump-screen"], surface),
     {
       encoding: "utf8",
     },
@@ -2988,6 +2962,22 @@ interface ExitSidecarPayload {
 }
 
 /**
+ * Read + consume the `.exit` sidecar for a session file. Returns the decoded
+ * PollResult, or null when the sidecar does not exist / is not yet readable.
+ */
+function readExitSidecar(sessionFile: string): PollResult | null {
+  const exitFile = `${sessionFile}.exit`;
+  try {
+    if (!existsSync(exitFile)) return null;
+    const data = JSON.parse(readFileSync(exitFile, "utf8"));
+    rmSync(exitFile, { force: true });
+    return interpretExitSidecar(data);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Interpret an `.exit` sidecar payload (written by subagent_done / caller_ping /
  * the error path in subagent-done.ts). Centralized so both the fast and slow
  * paths in pollForExit decode the payload the same way.
@@ -3044,14 +3034,8 @@ export async function pollForExit(
 
     // Fast path: check for .exit sidecar file (written by subagent_done / caller_ping)
     if (options.sessionFile) {
-      try {
-        const exitFile = `${options.sessionFile}.exit`;
-        if (existsSync(exitFile)) {
-          const data = JSON.parse(readFileSync(exitFile, "utf8"));
-          rmSync(exitFile, { force: true });
-          return interpretExitSidecar(data);
-        }
-      } catch {}
+      const sidecar = readExitSidecar(options.sessionFile);
+      if (sidecar) return sidecar;
     }
 
     // Check Claude sentinel file (written by plugin Stop hook)
@@ -3073,14 +3057,8 @@ export async function pollForExit(
     } catch {
       // Surface may have been destroyed — check if .exit file appeared in the meantime
       if (options.sessionFile) {
-        try {
-          const exitFile = `${options.sessionFile}.exit`;
-          if (existsSync(exitFile)) {
-            const data = JSON.parse(readFileSync(exitFile, "utf8"));
-            rmSync(exitFile, { force: true });
-            return interpretExitSidecar(data);
-          }
-        } catch {}
+        const sidecar = readExitSidecar(options.sessionFile);
+        if (sidecar) return sidecar;
       }
     }
 
