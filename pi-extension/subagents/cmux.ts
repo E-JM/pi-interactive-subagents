@@ -681,21 +681,25 @@ export function parseCmuxPaneRefForSurface(
     pane_ref?: unknown;
     caller?: unknown;
   };
-  if (record.surface_ref === surface && nonEmptyString(record.pane_ref))
-    return record.pane_ref;
+  const direct = paneRefForSurface(record, surface);
+  if (direct) return direct;
 
   const caller = record.caller;
   if (!caller || typeof caller !== "object") return null;
+  return paneRefForSurface(
+    caller as { surface_ref?: unknown; pane_ref?: unknown },
+    surface,
+  );
+}
 
-  const callerRecord = caller as { surface_ref?: unknown; pane_ref?: unknown };
-  if (
-    callerRecord.surface_ref === surface &&
-    nonEmptyString(callerRecord.pane_ref)
-  ) {
-    return callerRecord.pane_ref;
-  }
-
-  return null;
+/** The pane ref when `record` is for `surface` and carries a non-empty pane_ref. */
+function paneRefForSurface(
+  record: { surface_ref?: unknown; pane_ref?: unknown },
+  surface: string,
+): string | null {
+  return record.surface_ref === surface && nonEmptyString(record.pane_ref)
+    ? (record.pane_ref as string)
+    : null;
 }
 
 export function parseCmuxPaneRefForSurfaceFromJson(

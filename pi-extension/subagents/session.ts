@@ -117,6 +117,32 @@ export function getNewEntries(
  * auto-retry exhausts on a provider overload / rate limit / server error, and
  * without this fallback the parent would silently see a stale earlier message.
  */
+/** Non-empty text blocks of an assistant message, in order. */
+function assistantTexts(msg: MessageEntry): string[] {
+  return msg.message.content
+    .filter(
+      (block) =>
+        block.type === "text" &&
+        typeof block.text === "string" &&
+        block.text.trim() !== "",
+    )
+    .map((block) => block.text as string);
+}
+
+/** Error text when the assistant turn ended with a surfaced error. */
+function assistantErrorText(msg: MessageEntry): string | null {
+  const stopReason = (msg.message as { stopReason?: unknown }).stopReason;
+  const errorMessage = (msg.message as { errorMessage?: unknown }).errorMessage;
+  if (
+    stopReason === "error" &&
+    typeof errorMessage === "string" &&
+    errorMessage.trim() !== ""
+  ) {
+    return `Subagent error: ${errorMessage.trim()}`;
+  }
+  return null;
+}
+
 export function findLastAssistantMessage(
   entries: SessionEntry[],
 ): string | null {
@@ -126,27 +152,11 @@ export function findLastAssistantMessage(
     const msg = entry as MessageEntry;
     if (msg.message.role !== "assistant") continue;
 
-    const texts = msg.message.content
-      .filter(
-        (block) =>
-          block.type === "text" &&
-          typeof block.text === "string" &&
-          block.text.trim() !== "",
-      )
-      .map((block) => block.text as string);
-
+    const texts = assistantTexts(msg);
     if (texts.length > 0 && texts.join("").trim()) return texts.join("\n");
 
-    const stopReason = (msg.message as { stopReason?: unknown }).stopReason;
-    const errorMessage = (msg.message as { errorMessage?: unknown })
-      .errorMessage;
-    if (
-      stopReason === "error" &&
-      typeof errorMessage === "string" &&
-      errorMessage.trim() !== ""
-    ) {
-      return `Subagent error: ${errorMessage.trim()}`;
-    }
+    const error = assistantErrorText(msg);
+    if (error) return error;
   }
   return null;
 }

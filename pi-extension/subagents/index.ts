@@ -1392,42 +1392,118 @@ function closeRunningSubagent(running: RunningSubagent, reason: string): void {
  * Called from the 1s supervision interval for every running entry, independent
  * of the status widget config.
  */
+/**
+ * Idle ms since the run started waiting, or null when this tick cannot
+ * evaluate completion at all (wrong kind of subagent, run still active, no
+ * time reference).
+ */
+function completionIdleMs(
+  running: RunningSubagent,
+  state: RunningSubagent["statusState"],
+  now: number,
+): number | null {
+  if (running.cli === "claude") return null;
+  if (running.interactive) return null;
+  if (running.interruptRequested) return null;
+  if (running.completing) return null;
+
+  // Only terminal phases can deliver; skip the session-file read while the
+  // child is active/starting.
+  if (state.phase !== "waiting" && state.phase !== "done") return null;
+  const referenceMs = state.waitingSinceMs ?? state.lastActivityAtMs;
+  if (referenceMs == null) return null;
+  return Math.max(0, now - referenceMs);
+}
+
+/** Close the pane when the waiting run has idled past the idle-close window. */
+function idleCloseIfDue(running: RunningSubagent, idleMs: number): void {
+  if (
+    !running.exitSteerSuppressed &&
+    shouldIdleClose(
+      {
+        interactive: running.interactive,
+        interruptRequested: running.interruptRequested,
+        waitingDelivered: running.waitingDelivered,
+        idleMs,
+        deliveredWaitingSince: running.deliveredWaitingSince,
+        waitingSinceMs: running.statusState.waitingSinceMs,
+      },
+      { idleCloseMs: completionConfig.idleCloseMs },
+    )
+  ) {
+    closeRunningSubagent(running, "idle-close");
+  }
+}
+
+/**
+ * Last assistant message + its entry index from the session file, or null
+ * when the file is unreadable this tick.
+ */
+function readCompletionSummary(
+  sessionFile: string,
+): { summary: string; lastAssistantIndex: number } | null {
+  try {
+    const entries = getNewEntries(sessionFile, 0);
+    return {
+      lastAssistantIndex: findLastAssistantIndex(entries),
+      summary:
+        findLastAssistantMessage(entries) ??
+        "(finished without a closing message)",
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Steer the waiting result message to the parent and record the delivery snapshot. */
+function deliverWaitingResult(
+  pi: ExtensionAPI,
+  running: RunningSubagent,
+  summary: string,
+  lastAssistantIndex: number,
+  now: number,
+): void {
+  const state = running.statusState;
+  const elapsed = Math.floor((now - running.startTime) / 1000);
+  pi.sendMessage(
+    {
+      customType: "subagent_result",
+      content:
+        `${resultLabelWaiting(running.name, formatElapsed(elapsed))}\n\n` +
+        `${summary}\n\n` +
+        `Session: ${running.sessionFile}\n` +
+        `Reply live with subagent_message (name: "${running.name}"); close with subagent_close when done.`,
+      display: true,
+      details: {
+        name: running.name,
+        task: running.task,
+        agent: running.agent,
+        deliveredVia: "waiting",
+        sessionFile: running.sessionFile,
+        elapsed,
+      },
+    },
+    { triggerTurn: true, deliverAs: "steer" },
+  );
+
+  running.waitingDelivered = true;
+  running.deliveredWaitingSince = state.waitingSinceMs;
+  running.deliveredSequence = state.lastActivitySequence;
+  running.deliveredAssistantIndex = lastAssistantIndex;
+  // The closing message reached the parent: if the exit lane fires later
+  // for this same content (manual pane quit, slow exit), it must not steer
+  // a duplicate. A live subagent_message follow-up re-arms the exit lane.
+  running.exitSteerSuppressed = true;
+}
+
 function superviseRunCompletion(
   pi: ExtensionAPI,
   running: RunningSubagent,
   now: number,
 ): void {
-  if (running.cli === "claude") return;
-  if (running.interactive) return;
-  if (running.interruptRequested) return;
-  if (running.completing) return;
-
   const state = running.statusState;
-  // Only terminal phases can deliver; skip the session-file read while the
-  // child is active/starting.
-  if (state.phase !== "waiting" && state.phase !== "done") return;
-  const referenceMs = state.waitingSinceMs ?? state.lastActivityAtMs;
-  if (referenceMs == null) return;
-  const idleMs = Math.max(0, now - referenceMs);
-
-  const maybeIdleClose = () => {
-    if (
-      !running.exitSteerSuppressed &&
-      shouldIdleClose(
-        {
-          interactive: running.interactive,
-          interruptRequested: running.interruptRequested,
-          waitingDelivered: running.waitingDelivered,
-          idleMs,
-          deliveredWaitingSince: running.deliveredWaitingSince,
-          waitingSinceMs: state.waitingSinceMs,
-        },
-        { idleCloseMs: completionConfig.idleCloseMs },
-      )
-    ) {
-      closeRunningSubagent(running, "idle-close");
-    }
-  };
+  const idleMs = completionIdleMs(running, state, now);
+  if (idleMs == null) return;
 
   // Perf: a delivered run with no new activity since its delivery snapshot
   // cannot deliver anything new (the index guard would block it) — skip the
@@ -1437,24 +1513,14 @@ function superviseRunCompletion(
     state.lastActivitySequence != null &&
     state.lastActivitySequence === running.deliveredSequence
   ) {
-    maybeIdleClose();
+    idleCloseIfDue(running, idleMs);
     return;
   }
 
   // Read the session file once per candidate tick: the last assistant entry
   // index feeds the growth guard and its text becomes the closing summary.
-  // Unreadable file → skip this tick.
-  let summary: string;
-  let lastAssistantIndex: number;
-  try {
-    const entries = getNewEntries(running.sessionFile, 0);
-    lastAssistantIndex = findLastAssistantIndex(entries);
-    summary =
-      findLastAssistantMessage(entries) ??
-      "(finished without a closing message)";
-  } catch {
-    return;
-  }
+  const read = readCompletionSummary(running.sessionFile);
+  if (!read) return;
 
   const decision = shouldDeliverWaitingResult(
     {
@@ -1467,7 +1533,7 @@ function superviseRunCompletion(
       waitingSinceMs: state.waitingSinceMs,
       lastActivityAtMs: state.lastActivityAtMs,
       waitingDelivered: running.waitingDelivered,
-      lastAssistantIndex,
+      lastAssistantIndex: read.lastAssistantIndex,
       deliveredAssistantIndex: running.deliveredAssistantIndex,
     },
     { steerDebounceMs: completionConfig.steerDebounceMs },
@@ -1475,39 +1541,16 @@ function superviseRunCompletion(
   );
 
   if (decision.deliver) {
-    const elapsed = Math.floor((now - running.startTime) / 1000);
-    pi.sendMessage(
-      {
-        customType: "subagent_result",
-        content:
-          `${resultLabelWaiting(running.name, formatElapsed(elapsed))}\n\n` +
-          `${summary}\n\n` +
-          `Session: ${running.sessionFile}\n` +
-          `Reply live with subagent_message (name: "${running.name}"); close with subagent_close when done.`,
-        display: true,
-        details: {
-          name: running.name,
-          task: running.task,
-          agent: running.agent,
-          deliveredVia: "waiting",
-          sessionFile: running.sessionFile,
-          elapsed,
-        },
-      },
-      { triggerTurn: true, deliverAs: "steer" },
+    deliverWaitingResult(
+      pi,
+      running,
+      read.summary,
+      read.lastAssistantIndex,
+      now,
     );
-
-    running.waitingDelivered = true;
-    running.deliveredWaitingSince = state.waitingSinceMs;
-    running.deliveredSequence = state.lastActivitySequence;
-    running.deliveredAssistantIndex = lastAssistantIndex;
-    // The closing message reached the parent: if the exit lane fires later
-    // for this same content (manual pane quit, slow exit), it must not steer
-    // a duplicate. A live subagent_message follow-up re-arms the exit lane.
-    running.exitSteerSuppressed = true;
   }
 
-  maybeIdleClose();
+  idleCloseIfDue(running, idleMs);
 }
 
 /**

@@ -338,51 +338,35 @@ export function createStatusState(params: {
   };
 }
 
-export function observeStatus(
-  state: SubagentStatusState,
+/**
+ * Timestamp-first, sequence-tiebreak staleness check of an observation
+ * against a recorded watermark. When `rejectEqualSequence` is false, an
+ * observation at exactly (watermarkMs, watermarkSeq) counts as fresh — an
+ * identical re-observation is not stale. When true, only a strictly bumped
+ * sequence counts — the local override echoes back at its own coordinates.
+ */
+function observationIsStale(
+  updatedAt: number,
+  sequence: number,
+  watermarkMs: number | null,
+  watermarkSeq: number | null,
+  rejectEqualSequence: boolean,
+): boolean {
+  if (watermarkMs == null) return false;
+  if (updatedAt < watermarkMs) return true;
+  if (updatedAt > watermarkMs) return false;
+  if (watermarkSeq == null) return false;
+  return rejectEqualSequence
+    ? sequence <= watermarkSeq
+    : sequence < watermarkSeq;
+}
+
+/** Presence/phase fields derived from one accepted observation. */
+function observedStatusFields(
   observation: StatusObservation,
-  now: number,
-): SubagentStatusState {
-  if (state.source === "claude") return state;
-
-  if (observation.snapshot !== "present") {
-    return {
-      ...state,
-      firstObservationAtMs: state.firstObservationAtMs ?? now,
-      snapshotState: observation.snapshot,
-      snapshotProblemSinceMs: state.snapshotProblemSinceMs ?? now,
-      snapshotError: observation.snapshotError ?? null,
-    };
-  }
-
-  const updatedAt = observation.updatedAt;
-  const sequence = observation.sequence;
-  const lastActivityAtMs = state.lastActivityAtMs;
-  const lastActivitySequence = state.lastActivitySequence;
-  // Drop observations older than the last accepted one (timestamp first,
-  // sequence as tiebreaker) — late-arriving writes must not rewind state.
-  // Equal timestamp + equal sequence is accepted: an identical re-observation
-  // is not stale.
-  const olderThanLastActivity =
-    lastActivityAtMs != null &&
-    (updatedAt < lastActivityAtMs ||
-      (updatedAt === lastActivityAtMs &&
-        lastActivitySequence != null &&
-        sequence < lastActivitySequence));
-  if (olderThanLastActivity) return state;
-
-  // Same monotonicity guard against the interrupt's local override. The
-  // override recorded its own sequence, so an observation at exactly
-  // (overrideAtMs, overrideSequence) is the override itself echoing back —
-  // only a strictly bumped sequence is fresh. Hence <= here vs < above.
-  const blockedByLocalOverride =
-    state.localOverrideAtMs != null &&
-    (updatedAt < state.localOverrideAtMs ||
-      (updatedAt === state.localOverrideAtMs &&
-        state.localOverrideSequence != null &&
-        sequence <= state.localOverrideSequence));
-  if (blockedByLocalOverride) return state;
-
+  state: SubagentStatusState,
+  updatedAt: number,
+) {
   const phase = observation.phase;
   const activeNow = phase === "active" || observation.active === true;
   const activeSinceMs = activeNow
@@ -392,17 +376,77 @@ export function observeStatus(
     phase === "waiting"
       ? (observation.waitingSince ?? state.waitingSinceMs ?? updatedAt)
       : null;
+  return {
+    phase,
+    activeNow,
+    activeSinceMs,
+    activeScope: activeNow ? (observation.activeScope ?? null) : null,
+    waitingSinceMs,
+  };
+}
+
+/** State for a tick whose status snapshot was missing or errored. */
+function staleSnapshotState(
+  state: SubagentStatusState,
+  observation: StatusObservation,
+  now: number,
+): SubagentStatusState {
+  return {
+    ...state,
+    firstObservationAtMs: state.firstObservationAtMs ?? now,
+    snapshotState: observation.snapshot,
+    snapshotProblemSinceMs: state.snapshotProblemSinceMs ?? now,
+    snapshotError: observation.snapshotError ?? null,
+  };
+}
+
+export function observeStatus(
+  state: SubagentStatusState,
+  observation: StatusObservation,
+  now: number,
+): SubagentStatusState {
+  if (state.source === "claude") return state;
+
+  if (observation.snapshot !== "present") {
+    return staleSnapshotState(state, observation, now);
+  }
+
+  const updatedAt = observation.updatedAt;
+  const sequence = observation.sequence;
+  // Drop observations older than the last accepted one (timestamp first,
+  // sequence as tiebreaker) — late-arriving writes must not rewind state.
+  if (
+    observationIsStale(
+      updatedAt,
+      sequence,
+      state.lastActivityAtMs,
+      state.lastActivitySequence,
+      false,
+    )
+  )
+    return state;
+
+  // Same monotonicity guard against the interrupt's local override. The
+  // override recorded its own sequence, so an observation at exactly
+  // (overrideAtMs, overrideSequence) is the override itself echoing back —
+  // only a strictly bumped sequence is fresh. Hence rejectEqualSequence.
+  if (
+    observationIsStale(
+      updatedAt,
+      sequence,
+      state.localOverrideAtMs,
+      state.localOverrideSequence,
+      true,
+    )
+  )
+    return state;
 
   return {
     ...state,
     firstObservationAtMs: state.firstObservationAtMs ?? now,
     lastActivityAtMs: updatedAt,
     lastActivitySequence: sequence,
-    activeNow,
-    activeSinceMs,
-    activeScope: activeNow ? (observation.activeScope ?? null) : null,
-    waitingSinceMs,
-    phase,
+    ...observedStatusFields(observation, state, updatedAt),
     latestEvent: observation.latestEvent ?? null,
     activityLabel: observation.activityLabel ?? null,
     snapshotState: "present",
