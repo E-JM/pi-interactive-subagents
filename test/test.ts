@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
   appendFileSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -68,7 +69,7 @@ import {
   observeStatus,
   parseStatusConfig,
 } from "../pi-extension/subagents/status.ts";
-import {
+import subagentDoneExtension, {
   findLatestAssistantError,
   shouldAutoExitOnAgentEnd,
 } from "../pi-extension/subagents/subagent-done.ts";
@@ -86,10 +87,10 @@ function createSessionFile(dir: string, entries: object[]): string {
   return file;
 }
 
-function withTempDir(run: (dir: string) => void) {
+async function withTempDir<T>(run: (dir: string) => T | Promise<T>) {
   const dir = createTestDir();
   try {
-    run(dir);
+    return await run(dir);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -101,14 +102,29 @@ function createMockExtensionApi() {
   const registeredMessageRenderers: Array<any> = [];
   const sentUserMessages: string[] = [];
   const sentMessages: Array<any> = [];
+  const eventHandlers = new Map<
+    string,
+    Array<(event: any, ctx: any) => void>
+  >();
+  const registeredShortcuts: Array<any> = [];
   return {
     registeredTools,
     registeredCommands,
     registeredMessageRenderers,
     sentUserMessages,
     sentMessages,
+    eventHandlers,
+    registeredShortcuts,
+    emit(event: string, payload?: any, ctx?: any) {
+      for (const handler of eventHandlers.get(event) ?? [])
+        handler(payload, ctx);
+    },
     api: {
-      on() {},
+      on(name: string, handler: (event: any, ctx: any) => void) {
+        const list = eventHandlers.get(name) ?? [];
+        list.push(handler);
+        eventHandlers.set(name, list);
+      },
       registerTool(tool: any) {
         registeredTools.push(tool);
       },
@@ -118,7 +134,9 @@ function createMockExtensionApi() {
       registerMessageRenderer(name: string, renderer: any) {
         registeredMessageRenderers.push({ name, renderer });
       },
-      registerShortcut() {},
+      registerShortcut(name: string, shortcut: any) {
+        registeredShortcuts.push({ name, ...shortcut });
+      },
       sendUserMessage(message: string) {
         sentUserMessages.push(message);
       },
@@ -1614,6 +1632,11 @@ describe("subagent-done.ts", () => {
       assert.equal(shouldAutoExitOnAgentEnd(messages), false);
     });
 
+    it("exits when the turn produced no assistant message", () => {
+      assert.equal(shouldAutoExitOnAgentEnd([{ role: "user", content: [] }]), true);
+      assert.equal(shouldAutoExitOnAgentEnd(undefined), true);
+    });
+
     it("still exits when the latest turn ended with stopReason=error", () => {
       // Auto-exit subagents must shut down on retry-exhaustion errors so the
       // parent is woken. The error sidecar (written separately) carries the
@@ -1680,6 +1703,321 @@ describe("subagent-done.ts", () => {
       assert.equal(findLatestAssistantError(undefined), null);
       assert.equal(findLatestAssistantError([]), null);
     });
+  });
+});
+
+describe("subagent-done.ts extension bootstrap", () => {
+  const envKeys = [
+    "PI_SUBAGENT_NAME",
+    "PI_SUBAGENT_AGENT",
+    "PI_DENY_TOOLS",
+    "PI_SUBAGENT_AUTO_EXIT",
+    "PI_SUBAGENT_ID",
+    "PI_SUBAGENT_ACTIVITY_FILE",
+    "PI_SUBAGENT_SESSION",
+  ];
+  let savedEnv: Record<string, string | undefined>;
+  before(() => {
+    savedEnv = {};
+    for (const key of envKeys) savedEnv[key] = process.env[key];
+  });
+  after(() => {
+    for (const key of envKeys) restoreEnvVar(key, savedEnv[key]);
+  });
+
+  function bootstrap(env: Record<string, string> = {}) {
+    for (const key of envKeys) delete process.env[key];
+    Object.assign(process.env, env);
+    const mock = createMockExtensionApi();
+    subagentDoneExtension(mock.api);
+    return mock;
+  }
+
+  function makeCtx(dir: string, env: Record<string, string> = {}) {
+    const setWidgetCalls: Array<{ key: string; factory: any }> = [];
+    let shutdowns = 0;
+    const sessionFile = join(dir, "session.jsonl");
+    const ctx = {
+      ui: {
+        setWidget: (key: string, factory: any) =>
+          setWidgetCalls.push({ key, factory }),
+      },
+      shutdown: () => {
+        shutdowns++;
+      },
+      sessionFile,
+      env,
+    };
+    return { ctx, setWidgetCalls, shutdowns: () => shutdowns, sessionFile };
+  }
+
+  const theme = {
+    bg: (_key: string, text: string) => text,
+    fg: (_key: string, text: string) => text,
+    bold: (text: string) => text,
+  };
+
+  it("registers lifecycle handlers, both exit tools, and the ctrl+j shortcut", () => {
+    const mock = bootstrap();
+    for (const event of [
+      "session_start",
+      "input",
+      "before_agent_start",
+      "agent_start",
+      "agent_end",
+      "turn_start",
+      "turn_end",
+      "before_provider_request",
+      "after_provider_response",
+      "message_update",
+      "tool_execution_start",
+      "tool_call",
+      "tool_execution_update",
+      "tool_result",
+      "tool_execution_end",
+      "session_shutdown",
+    ]) {
+      assert.ok(mock.eventHandlers.has(event), `missing handler for ${event}`);
+    }
+    assert.deepEqual(mock.registeredTools.map((t) => t.name).sort(), [
+      "caller_ping",
+      "subagent_done",
+    ]);
+    assert.equal(mock.registeredShortcuts[0]?.name, "ctrl+j");
+  });
+
+  it("session_start renders the identity widget", () => {
+    withTempDir((dir) => {
+      const mock = bootstrap({ PI_SUBAGENT_NAME: "worker" });
+      const { ctx, setWidgetCalls } = makeCtx(dir);
+      mock.emit("session_start", {}, ctx);
+      assert.equal(setWidgetCalls.length, 1);
+      assert.equal(setWidgetCalls[0].key, "subagent-tools");
+      const box = setWidgetCalls[0].factory(null, theme);
+      assert.ok(Array.isArray(box.render(60)));
+    });
+  });
+
+  it("ctrl+j toggles the widget between collapsed and expanded", () => {
+    withTempDir((dir) => {
+      const mock = bootstrap({ PI_SUBAGENT_NAME: "worker" });
+      const { ctx, setWidgetCalls } = makeCtx(dir);
+      mock.emit("session_start", {}, ctx);
+      const collapsed = setWidgetCalls[0].factory(null, theme).render(60).join("\n");
+      assert.match(collapsed, /Ctrl\+J to expand/);
+      mock.registeredShortcuts[0].handler(ctx);
+      const expanded = setWidgetCalls[1].factory(null, theme).render(60).join("\n");
+      assert.match(expanded, /Ctrl\+J to collapse/);
+      assert.match(expanded, /0 available/);
+      mock.registeredShortcuts[0].handler(ctx);
+      assert.match(setWidgetCalls[2].factory(null, theme).render(60).join("\n"), /Ctrl\+J to expand/);
+    });
+  });
+
+  it("widget lists available and denied tools", () => {
+    withTempDir((dir) => {
+      const mock = bootstrap({ PI_DENY_TOOLS: "write, edit" });
+      mock.api.getAllTools = () => [{ name: "read" }, { name: "write" }];
+      const { ctx, setWidgetCalls } = makeCtx(dir);
+      mock.emit("session_start", {}, ctx);
+      const collapsed = setWidgetCalls[0].factory(null, theme).render(60).join("\n");
+      assert.match(collapsed, /2 tools/);
+      assert.match(collapsed, /2 denied/);
+      mock.registeredShortcuts[0].handler(ctx);
+      const expanded = setWidgetCalls[1].factory(null, theme).render(60).join("\n");
+      assert.match(expanded, /read/);
+      assert.match(expanded, /denied: write, edit/);
+    });
+  });
+
+  it("lifecycle events reach the activity recorder file the parent reads", () => {
+    withTempDir((dir) => {
+      const activityFile = join(dir, "activity.json");
+      const mock = bootstrap({
+        PI_SUBAGENT_ID: "child-1",
+        PI_SUBAGENT_ACTIVITY_FILE: activityFile,
+      });
+      const { ctx } = makeCtx(dir);
+      mock.emit("session_start", {}, ctx);
+      mock.emit("input");
+      mock.emit("before_agent_start");
+      mock.emit("agent_start");
+      mock.emit("turn_start", { turnIndex: 0 });
+      mock.emit("before_provider_request");
+      mock.emit("after_provider_response");
+      mock.emit("message_update", { assistantMessageEvent: { type: "text" } });
+      mock.emit("tool_execution_start", { toolCallId: "t1", toolName: "read" });
+      mock.emit("tool_call", { toolCallId: "t1", toolName: "read" });
+      mock.emit("tool_execution_update", { toolCallId: "t1", toolName: "read" });
+      mock.emit("tool_result", { toolCallId: "t1", toolName: "read" });
+      mock.emit("tool_execution_end", { toolCallId: "t1", toolName: "read" });
+      mock.emit("turn_end", { turnIndex: 0 });
+      mock.emit("agent_end", { messages: [{ role: "assistant", stopReason: "stop" }] }, ctx);
+      mock.emit("session_shutdown");
+      const activity = readSubagentActivityFile(activityFile);
+      assert.ok(activity, "activity file was written");
+    });
+  });
+
+  it("agent_end shuts down an auto-exit subagent after a normal turn", () => {
+    withTempDir((dir) => {
+      const mock = bootstrap({ PI_SUBAGENT_AUTO_EXIT: "1" });
+      const { ctx, shutdowns, sessionFile } = makeCtx(dir);
+      mock.emit(
+        "agent_end",
+        { messages: [{ role: "assistant", stopReason: "stop" }] },
+        ctx,
+      );
+      assert.equal(shutdowns(), 1);
+      assert.ok(!existsSync(`${sessionFile}.exit`));
+    });
+  });
+
+  it("agent_end keeps an aborted auto-exit subagent alive", () => {
+    withTempDir((dir) => {
+      const mock = bootstrap({ PI_SUBAGENT_AUTO_EXIT: "1" });
+      const { ctx, shutdowns } = makeCtx(dir);
+      mock.emit(
+        "agent_end",
+        { messages: [{ role: "assistant", stopReason: "aborted" }] },
+        ctx,
+      );
+      assert.equal(shutdowns(), 0);
+    });
+  });
+
+  it("agent_end ignores autoExit when the parent did not opt in", () => {
+    withTempDir((dir) => {
+      const mock = bootstrap({});
+      const { ctx, shutdowns } = makeCtx(dir);
+      mock.emit(
+        "agent_end",
+        { messages: [{ role: "assistant", stopReason: "stop" }] },
+        ctx,
+      );
+      assert.equal(shutdowns(), 0);
+    });
+  });
+
+  it("agent_end writes an error sidecar when the turn ended with stopReason=error", () => {
+    withTempDir((dir) => {
+      const mock = bootstrap({ PI_SUBAGENT_AUTO_EXIT: "1" });
+      const { ctx, shutdowns, sessionFile } = makeCtx(dir);
+      process.env.PI_SUBAGENT_SESSION = sessionFile;
+      mock.emit(
+        "agent_end",
+        {
+          messages: [
+            {
+              role: "assistant",
+              stopReason: "error",
+              errorMessage: "529 overloaded",
+            },
+          ],
+        },
+        ctx,
+      );
+      assert.equal(shutdowns(), 1);
+      assert.deepEqual(
+        JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")),
+        {
+          type: "error",
+          errorMessage: "529 overloaded",
+          stopReason: "error",
+        },
+      );
+    });
+  });
+
+  it("agent_end still shuts down when the error sidecar path is unwritable", () => {
+    withTempDir((dir) => {
+      const mock = bootstrap({ PI_SUBAGENT_AUTO_EXIT: "1" });
+      const { ctx, shutdowns } = makeCtx(dir);
+      process.env.PI_SUBAGENT_SESSION = join(dir, "missing-dir", "session.jsonl");
+      mock.emit(
+        "agent_end",
+        {
+          messages: [
+            {
+              role: "assistant",
+              stopReason: "error",
+              errorMessage: "529 overloaded",
+            },
+          ],
+        },
+        ctx,
+      );
+      assert.equal(shutdowns(), 1, "shutdown must not be blocked by a failed sidecar write");
+    });
+  });
+
+  it("caller_ping throws outside a subagent context", async () => {
+    const mock = bootstrap({});
+    const tool = mock.registeredTools.find((t) => t.name === "caller_ping");
+    await assert.rejects(
+      () =>
+        tool.execute(
+          "id",
+          { message: "help" },
+          undefined,
+          undefined,
+          {} as any,
+        ),
+      /PI_SUBAGENT_SESSION/,
+    );
+  });
+
+  it("caller_ping writes a ping sidecar, shuts down, and confirms", async () => {
+    await withTempDir(async (dir) => {
+      const mock = bootstrap({
+        PI_SUBAGENT_SESSION: join(dir, "session.jsonl"),
+      });
+      const tool = mock.registeredTools.find((t) => t.name === "caller_ping");
+      const { ctx, shutdowns, sessionFile } = makeCtx(dir);
+      const result = await tool.execute(
+        "id",
+        { message: "need a decision" },
+        undefined,
+        undefined,
+        ctx,
+      );
+      assert.equal(shutdowns(), 1);
+      assert.deepEqual(
+        JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")),
+        {
+          type: "ping",
+          name: "subagent",
+          message: "need a decision",
+        },
+      );
+      assert.match(result.content[0].text, /Ping sent/);
+    });
+  });
+
+  it("subagent_done writes a done sidecar and shuts down", async () => {
+    await withTempDir(async (dir) => {
+      const mock = bootstrap({
+        PI_SUBAGENT_SESSION: join(dir, "session.jsonl"),
+      });
+      const tool = mock.registeredTools.find((t) => t.name === "subagent_done");
+      const { ctx, shutdowns, sessionFile } = makeCtx(dir);
+      const result = await tool.execute("id", {}, undefined, undefined, ctx);
+      assert.equal(shutdowns(), 1);
+      assert.deepEqual(
+        JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")),
+        { type: "done" },
+      );
+      assert.match(result.content[0].text, /Shutting down/);
+    });
+  });
+
+  it("subagent_done still shuts down without a session sidecar path", async () => {
+    const mock = bootstrap({});
+    const tool = mock.registeredTools.find((t) => t.name === "subagent_done");
+    const { ctx, shutdowns } = makeCtx("/nonexistent");
+    const result = await tool.execute("id", {}, undefined, undefined, ctx);
+    assert.equal(shutdowns(), 1);
+    assert.match(result.content[0].text, /Shutting down/);
   });
 });
 
