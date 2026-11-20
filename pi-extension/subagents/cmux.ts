@@ -1291,6 +1291,38 @@ export function selectTiledGridAnchor(
 /** Ratio deltas below this are treated as already-balanced (avoids rounding churn). */
 const HERDR_RESIZE_EPSILON = 0.01;
 
+/**
+ * Divider movement so the low side holds `lowTarget / (lowTarget + highTarget)`;
+ * null when the split is already balanced or the targets sum to zero.
+ */
+function dividerDelta(
+  lowTarget: number,
+  highTarget: number,
+  ratio: number,
+): number | null {
+  if (!(lowTarget + highTarget > 0)) return null;
+  const delta = lowTarget / (lowTarget + highTarget) - ratio;
+  if (Math.abs(delta) < HERDR_RESIZE_EPSILON) return null;
+  return delta;
+}
+
+/**
+ * Pane a divider move is anchored on (herdr resolves ops by the anchor pane):
+ * the leaf flush against the divider on the side the divider moves away from.
+ */
+function dividerAnchor(
+  axis: GridAxis,
+  delta: number,
+  lowLeaves: HerdrLayoutPane[],
+  highLeaves: HerdrLayoutPane[],
+): { anchor: HerdrLayoutPane; grow: boolean } {
+  const anchor =
+    delta > 0
+      ? [...lowLeaves].sort((a, b) => axis.low(b.rect) - axis.low(a.rect))[0]
+      : [...highLeaves].sort((a, b) => axis.low(a.rect) - axis.low(b.rect))[0];
+  return { anchor, grow: delta > 0 };
+}
+
 /** One `herdr pane resize` step: move the divider on the pane's `direction` side by `amount` (a ratio delta). */
 export interface HerdrResizeOp {
   paneId: string;
@@ -1339,16 +1371,19 @@ function herdrBalancePreflight(
   return { total, parent };
 }
 
-export function planHerdrRebalance(
+/**
+ * Width target per pane for the single-row column layout (parent at
+ * `parentRatio`, each column cell sharing the rest, frozen panes keep their
+ * width). Returns null when there is nothing to balance or the targets
+ * cannot fit.
+ */
+function herdrColumnTargets(
   layout: HerdrLayout,
   parentPaneId: string,
+  parent: HerdrLayoutPane,
+  total: HerdrRect,
   parentRatio: number,
-): HerdrResizeOp[] {
-  const pre = herdrBalancePreflight(layout, parentPaneId);
-  if (!pre) return [];
-  const { total, parent } = pre;
-  const ops: HerdrResizeOp[] = [];
-
+): ((pane: HerdrLayoutPane) => number) | null {
   // Column cells: full-height panes starting at/after the parent's right edge.
   const parentRight = parent.rect.x + parent.rect.width;
   const cells = layout.panes
@@ -1363,7 +1398,7 @@ export function planHerdrRebalance(
 
   // Panes we won't move (left of the parent, or stacked rows): keep widths.
   const cellIds = new Set(cells.map((cell) => cell.pane_id));
-  if (cellIds.size === 0) return ops; // nothing to balance
+  if (cellIds.size === 0) return null; // nothing to balance
   const frozenSum = layout.panes
     .filter(
       (pane) => pane.pane_id !== parentPaneId && !cellIds.has(pane.pane_id),
@@ -1372,15 +1407,25 @@ export function planHerdrRebalance(
 
   const parentTarget = parentRatio * total.width;
   const remaining = total.width - parentTarget - frozenSum;
-  if (cells.length > 0 && !(remaining > 5)) return ops; // can't fit; leave the layout alone
+  if (cells.length > 0 && !(remaining > 5)) return null; // can't fit; leave the layout alone
   const cellTarget = cells.length > 0 ? remaining / cells.length : 0;
 
-  const targetWidth = (pane: HerdrLayoutPane): number => {
+  return (pane: HerdrLayoutPane): number => {
     if (pane.pane_id === parentPaneId) return parentTarget;
     if (cellIds.has(pane.pane_id)) return cellTarget;
     return pane.rect.width; // frozen
   };
+}
 
+/**
+ * Walk the vertical splits outermost-first, moving each divider toward its
+ * side's width target. Empty when any divider move is ambiguous — herdr
+ * could move either of two coincident dividers, so no op can be trusted.
+ */
+function herdrColumnDividerOps(
+  layout: HerdrLayout,
+  targetWidth: (pane: HerdrLayoutPane) => number,
+): HerdrResizeOp[] {
   // Outermost splits first.
   const rightSplits = layout.splits.filter(
     (split) => split.direction === "right",
@@ -1388,17 +1433,12 @@ export function planHerdrRebalance(
   const splits = [...rightSplits].sort(
     (a, b) => b.rect.width * b.rect.height - a.rect.width * a.rect.height,
   );
-  const dividerXOf = (split: HerdrLayoutSplit): number =>
-    split.rect.x + split.rect.width * split.ratio;
-  const overlapsY = (anchor: HerdrLayoutPane, rect: HerdrRect): boolean =>
-    anchor.rect.y < rect.y + rect.height + 1.5 &&
-    anchor.rect.y + anchor.rect.height > rect.y - 1.5;
 
-  // Coincident dividers make a resize ambiguous (see guard below) — bail.
   let ambiguous = false;
+  const ops: HerdrResizeOp[] = [];
 
   for (const split of splits) {
-    const dividerX = dividerXOf(split);
+    const dividerX = split.rect.x + split.rect.width * split.ratio;
     const leftRect: HerdrRect = {
       x: split.rect.x,
       y: split.rect.y,
@@ -1427,36 +1467,24 @@ export function planHerdrRebalance(
       (sum, pane) => sum + targetWidth(pane),
       0,
     );
-    if (!(leftTarget + rightTarget > 0)) continue;
+    const delta = dividerDelta(leftTarget, rightTarget, split.ratio);
+    if (delta === null) continue;
 
-    const delta = leftTarget / (leftTarget + rightTarget) - split.ratio;
-    if (Math.abs(delta) < HERDR_RESIZE_EPSILON) continue;
-
-    let anchor: HerdrLayoutPane;
-    let grow: boolean;
-    if (delta > 0) {
-      // Grow: move the divider right, anchored on the pane beside it.
-      anchor = [...leftLeaves].sort((a, b) => b.rect.x - a.rect.x)[0];
-      grow = true;
-    } else {
-      // Shrink: same divider, from the right side.
-      anchor = [...rightLeaves].sort((a, b) => a.rect.x - b.rect.x)[0];
-      grow = false;
-    }
+    const { anchor, grow } = dividerAnchor(
+      AXIS_X,
+      delta,
+      leftLeaves,
+      rightLeaves,
+    );
 
     // Skip if another split's divider coincides with this one — herdr could
     // move either one. Only happens in legacy layouts this code never creates.
     const anchorEdge = grow ? anchor.rect.x + anchor.rect.width : anchor.rect.x;
     if (Math.abs(anchorEdge - dividerX) > 1.5) continue;
-    for (const other of rightSplits) {
-      if (other === split) continue;
-      if (!overlapsY(anchor, other.rect)) continue;
-      if (Math.abs(dividerXOf(other) - dividerX) <= 1.5) {
-        ambiguous = true;
-        break;
-      }
+    if (hasCoincidentDivider(rightSplits, split, anchor, dividerX)) {
+      ambiguous = true;
+      break;
     }
-    if (ambiguous) break;
 
     ops.push({
       paneId: anchor.pane_id,
@@ -1464,8 +1492,48 @@ export function planHerdrRebalance(
       amount: grow ? delta : -delta,
     });
   }
-  if (ambiguous) return [];
-  return ops;
+  return ambiguous ? [] : ops;
+}
+
+export function planHerdrRebalance(
+  layout: HerdrLayout,
+  parentPaneId: string,
+  parentRatio: number,
+): HerdrResizeOp[] {
+  const pre = herdrBalancePreflight(layout, parentPaneId);
+  if (!pre) return [];
+  const targetWidth = herdrColumnTargets(
+    layout,
+    parentPaneId,
+    pre.parent,
+    pre.total,
+    parentRatio,
+  );
+  if (!targetWidth) return [];
+  return herdrColumnDividerOps(layout, targetWidth);
+}
+
+/**
+ * True when another split's divider is coincident with `dividerX` while
+ * overlapping `anchor` vertically — herdr could move either one, so the
+ * resize is ambiguous and the whole plan must abort.
+ */
+function hasCoincidentDivider(
+  rightSplits: HerdrLayoutSplit[],
+  split: HerdrLayoutSplit,
+  anchor: HerdrLayoutPane,
+  dividerX: number,
+): boolean {
+  const overlapsY = (rect: HerdrRect): boolean =>
+    anchor.rect.y < rect.y + rect.height + 1.5 &&
+    anchor.rect.y + anchor.rect.height > rect.y - 1.5;
+  for (const other of rightSplits) {
+    if (other === split) continue;
+    if (!overlapsY(other.rect)) continue;
+    const otherX = other.rect.x + other.rect.width * other.ratio;
+    if (Math.abs(otherX - dividerX) <= 1.5) return true;
+  }
+  return false;
 }
 
 /** Axis-specific accessors, so one planner serves both divider orientations. */
@@ -1509,6 +1577,25 @@ const AXIS_Y: GridAxis = {
 };
 
 /**
+ * Bounding-box extent of the leaves' target rects along `axis` (stacked panes
+ * share columns/rows, so summing extents would double-count).
+ */
+function dividerSideExtent(
+  axis: GridAxis,
+  leaves: HerdrLayoutPane[],
+  targetRectOf: (pane: HerdrLayoutPane) => HerdrRect,
+): number {
+  let low = Infinity;
+  let high = -Infinity;
+  for (const leaf of leaves) {
+    const rect = targetRectOf(leaf);
+    low = Math.min(low, axis.low(rect));
+    high = Math.max(high, axis.low(rect) + axis.size(rect));
+  }
+  return Number.isFinite(low) ? high - low : 0;
+}
+
+/**
  * Plan resize ops for one axis's dividers: each divider moves so its low side
  * holds `lowTarget / (lowTarget + highTarget)` of the split ratio, where the
  * side targets are bounding-box extents of the leaves' target rects (stacked
@@ -1526,16 +1613,6 @@ function planDividerOps(
   targetRectOf: (pane: HerdrLayoutPane) => HerdrRect,
 ): HerdrResizeOp[] {
   const ops: HerdrResizeOp[] = [];
-  const targetExtentOf = (leaves: HerdrLayoutPane[]): number => {
-    let low = Infinity;
-    let high = -Infinity;
-    for (const leaf of leaves) {
-      const rect = targetRectOf(leaf);
-      low = Math.min(low, axis.low(rect));
-      high = Math.max(high, axis.low(rect) + axis.size(rect));
-    }
-    return Number.isFinite(low) ? high - low : 0;
-  };
 
   for (const split of splits) {
     const start = axis.low(split.rect);
@@ -1549,26 +1626,14 @@ function planDividerOps(
     );
     if (lowLeaves.length === 0 || highLeaves.length === 0) continue;
 
-    const lowTarget = targetExtentOf(lowLeaves);
-    const highTarget = targetExtentOf(highLeaves);
-    if (!(lowTarget + highTarget > 0)) continue;
+    const delta = dividerDelta(
+      dividerSideExtent(axis, lowLeaves, targetRectOf),
+      dividerSideExtent(axis, highLeaves, targetRectOf),
+      split.ratio,
+    );
+    if (delta === null) continue;
 
-    const delta = lowTarget / (lowTarget + highTarget) - split.ratio;
-    if (Math.abs(delta) < HERDR_RESIZE_EPSILON) continue;
-
-    let anchor: HerdrLayoutPane;
-    let grow: boolean;
-    if (delta > 0) {
-      anchor = [...lowLeaves].sort(
-        (a, b) => axis.low(b.rect) - axis.low(a.rect),
-      )[0];
-      grow = true;
-    } else {
-      anchor = [...highLeaves].sort(
-        (a, b) => axis.low(a.rect) - axis.low(b.rect),
-      )[0];
-      grow = false;
-    }
+    const { anchor, grow } = dividerAnchor(axis, delta, lowLeaves, highLeaves);
 
     const anchorEdge = grow
       ? axis.low(anchor.rect) + axis.size(anchor.rect)
@@ -1981,15 +2046,22 @@ export interface TmuxResizeOp {
  * Plan absolute-width resizes: parent at `parentRatio` of the window, every
  * full-height pane to its right sharing the rest equally. Pure — no CLI calls.
  */
-export function planTmuxRebalance(
+/**
+ * Parent pane and the full-height column cells right of it for the
+ * single-row column layout, or null when there is nothing to balance.
+ */
+function tmuxColumnLayout(
   panes: TmuxPaneGeometry[],
   parentPaneId: string,
-  parentRatio: number,
-): TmuxResizeOp[] {
+): {
+  parent: TmuxPaneGeometry;
+  windowWidth: number;
+  cells: TmuxPaneGeometry[];
+} | null {
   const parent = panes.find((pane) => pane.paneId === parentPaneId);
-  if (!parent) return [];
+  if (!parent) return null;
   const windowWidth = parent.windowWidth;
-  if (!(windowWidth > 0) || !(parent.width > 0)) return [];
+  if (!(windowWidth > 0) || !(parent.width > 0)) return null;
 
   const parentRight = parent.left + parent.width;
   const cells = panes
@@ -2001,7 +2073,28 @@ export function planTmuxRebalance(
         pane.top <= parent.top + 1,
     )
     .sort((a, b) => a.top - b.top || a.left - b.left);
-  if (cells.length === 0) return [];
+  if (cells.length === 0) return null;
+  return { parent, windowWidth, cells };
+}
+
+/** Absolute-width resize toward `target`, or undefined when within 1 column. */
+function tmuxWidthOp(
+  paneId: string,
+  current: number,
+  target: number,
+): TmuxResizeOp | undefined {
+  if (Math.abs(current - target) <= 1) return undefined;
+  return { paneId, width: target };
+}
+
+export function planTmuxRebalance(
+  panes: TmuxPaneGeometry[],
+  parentPaneId: string,
+  parentRatio: number,
+): TmuxResizeOp[] {
+  const layout = tmuxColumnLayout(panes, parentPaneId);
+  if (!layout) return [];
+  const { parent, windowWidth, cells } = layout;
 
   const parentTarget = Math.round(parentRatio * windowWidth);
   const remaining = windowWidth - parentTarget;
@@ -2010,13 +2103,11 @@ export function planTmuxRebalance(
 
   const cellTarget = Math.floor(remaining / cells.length);
   const ops: TmuxResizeOp[] = [];
-  if (Math.abs(parent.width - parentTarget) > 1) {
-    ops.push({ paneId: parentPaneId, width: parentTarget });
-  }
+  const parentOp = tmuxWidthOp(parentPaneId, parent.width, parentTarget);
+  if (parentOp) ops.push(parentOp);
   for (const cell of cells) {
-    if (Math.abs(cell.width - cellTarget) > 1) {
-      ops.push({ paneId: cell.paneId, width: cellTarget });
-    }
+    const op = tmuxWidthOp(cell.paneId, cell.width, cellTarget);
+    if (op) ops.push(op);
   }
   return ops;
 }
