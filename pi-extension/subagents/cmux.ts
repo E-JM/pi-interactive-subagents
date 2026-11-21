@@ -917,42 +917,55 @@ function readHerdrLayout(paneId?: string): HerdrLayout | null {
   }
 }
 
+/**
+ * Pane-id tracking shared by herdr and tmux: globalThis + Symbol.for so the
+ * list survives /reload; ids stay in spawn order (grid fill order).
+ */
+function createTrackedPaneList(key: symbol) {
+  const paneList = (): string[] => {
+    const store = globalThis as Record<symbol, unknown>;
+    if (!Array.isArray(store[key])) {
+      store[key] = [];
+    }
+    return store[key] as string[];
+  };
+  const setPaneList = (paneIds: string[]): void => {
+    (globalThis as Record<symbol, unknown>)[key] = [...paneIds];
+  };
+  return {
+    paneList,
+    setPaneList,
+    /** Track a spawned subagent pane so layout ops stay in the group (idempotent). */
+    track(paneId: string): void {
+      const panes = paneList();
+      if (!panes.includes(paneId)) panes.push(paneId);
+    },
+    /** Forget a subagent pane after its surface closes. */
+    untrack(paneId: string): void {
+      setPaneList(paneList().filter((id) => id !== paneId));
+    },
+  };
+}
+
 /** Tracked herdr subagent panes; globalThis + Symbol.for so it survives /reload. */
 const HERDR_SUBAGENT_PANES_KEY = Symbol.for(
   "pi-subagents/herdr-subagent-panes",
 );
 
+const herdrPanes = createTrackedPaneList(HERDR_SUBAGENT_PANES_KEY);
+
 /** Tracked herdr subagent pane ids, in spawn order (grid fill order). */
 function herdrSubagentPaneList(): string[] {
-  const store = globalThis as Record<symbol, unknown>;
-  if (!Array.isArray(store[HERDR_SUBAGENT_PANES_KEY])) {
-    store[HERDR_SUBAGENT_PANES_KEY] = [];
-  }
-  return store[HERDR_SUBAGENT_PANES_KEY] as string[];
+  return herdrPanes.paneList();
 }
 
 /** Replace the tracked herdr subagent pane list. Exported for tests. */
 export function setHerdrSubagentPaneList(paneIds: string[]): void {
-  (globalThis as Record<symbol, unknown>)[HERDR_SUBAGENT_PANES_KEY] = [
-    ...paneIds,
-  ];
+  herdrPanes.setPaneList(paneIds);
 }
 
-/**
- * Track a spawned herdr subagent pane so layout ops stay in the group
- * (idempotent).
- */
-function herdrTrackPane(paneId: string): void {
-  const panes = herdrSubagentPaneList();
-  if (!panes.includes(paneId)) panes.push(paneId);
-}
-
-/** Forget a herdr subagent pane after its surface closes. */
-function herdrUntrackPane(paneId: string): void {
-  setHerdrSubagentPaneList(
-    herdrSubagentPaneList().filter((id) => id !== paneId),
-  );
-}
+const herdrTrackPane = herdrPanes.track;
+const herdrUntrackPane = herdrPanes.untrack;
 
 /** Default fraction of the tab width reserved for the parent (main agent) pane. */
 const DEFAULT_SUBAGENT_PARENT_RATIO = 0.4;
@@ -1803,17 +1816,21 @@ export function planHerdrGridRebalance(
   const tracked = trackedPaneIds.filter((id) =>
     layout.panes.some((pane) => pane.pane_id === id),
   );
-  // A foreign pane right of the parent inside the region (a user split in
-  // the grid area) would get wrecked by the rebalance — bail. Foreign panes
-  // elsewhere are not ours to care about.
-  const trackedSet = new Set(tracked);
   const parentRight = parent.rect.x + parent.rect.width;
-  const isForeignInRegion = (pane: HerdrLayoutPane): boolean =>
-    pane.pane_id !== parentPaneId &&
-    !trackedSet.has(pane.pane_id) &&
-    paneInRect(pane, region) &&
-    pane.rect.x >= parentRight - 1;
-  if (layout.panes.some(isForeignInRegion)) return ops;
+  if (
+    foreignPaneInGridArea(
+      layout.panes,
+      parentPaneId,
+      tracked,
+      region,
+      parentRight,
+      (pane) => pane.pane_id,
+      (pane) => pane.rect.x,
+      (pane) => paneInRect(pane, region),
+    )
+  ) {
+    return ops;
+  }
   const targets = planGridTargets(tracked, region, parentRatio);
   if (!targets) return ops;
 
@@ -1888,18 +1905,58 @@ function rebalanceHerdrSubagentLayout(parentPaneId: string): void {
  * panes outside it. A solo parent's region is exactly its own rect; in an
  * unshared tab that is the whole tab, so the layout math is unchanged.
  */
+function groupRegionOf<P>(
+  panes: P[],
+  parentRect: GridRect,
+  idOf: (pane: P) => string,
+  rectOf: (pane: P) => GridRect,
+  trackedPaneIds: string[],
+): GridRect {
+  const tracked = new Set(trackedPaneIds);
+  return boundingRect([
+    parentRect,
+    ...panes.filter((pane) => tracked.has(idOf(pane))).map(rectOf),
+  ]);
+}
+
 function herdrGroupRegion(
   layout: HerdrLayout,
   parent: HerdrLayoutPane,
   trackedPaneIds?: string[],
 ): HerdrRect {
-  const tracked = new Set(trackedPaneIds ?? herdrSubagentPaneList());
-  return boundingRect([
+  return groupRegionOf(
+    layout.panes,
     parent.rect,
-    ...layout.panes
-      .filter((pane) => tracked.has(pane.pane_id))
-      .map((pane) => pane.rect),
-  ]);
+    (pane) => pane.pane_id,
+    (pane) => pane.rect,
+    trackedPaneIds ?? herdrSubagentPaneList(),
+  );
+}
+
+/**
+ * One bail decision for both grid planners: a foreign pane right of the
+ * parent inside the group's region (a user split in the grid area) would get
+ * wrecked by the rebalance — bail the whole plan. Foreign panes elsewhere
+ * are not ours to care about.
+ */
+function foreignPaneInGridArea<P>(
+  panes: P[],
+  parentPaneId: string,
+  trackedPaneIds: string[],
+  region: GridRect,
+  parentRight: number,
+  idOf: (pane: P) => string,
+  leftOf: (pane: P) => number,
+  inRegion: (pane: P) => boolean,
+): boolean {
+  const tracked = new Set(trackedPaneIds);
+  return panes.some(
+    (pane) =>
+      idOf(pane) !== parentPaneId &&
+      !tracked.has(idOf(pane)) &&
+      inRegion(pane) &&
+      leftOf(pane) >= parentRight - 1,
+  );
 }
 
 /**
@@ -2171,35 +2228,20 @@ function readTmuxPaneGeometry(targetPaneId?: string): TmuxPaneGeometry[] {
 /** Tracked tmux subagent panes; globalThis + Symbol.for so it survives /reload. */
 const TMUX_SUBAGENT_PANES_KEY = Symbol.for("pi-subagents/tmux-subagent-panes");
 
+const tmuxPanes = createTrackedPaneList(TMUX_SUBAGENT_PANES_KEY);
+
 /** Tracked tmux subagent pane ids, in spawn order (defines grid fill order). */
 function tmuxSubagentPaneList(): string[] {
-  const store = globalThis as Record<symbol, unknown>;
-  if (!Array.isArray(store[TMUX_SUBAGENT_PANES_KEY])) {
-    store[TMUX_SUBAGENT_PANES_KEY] = [];
-  }
-  return store[TMUX_SUBAGENT_PANES_KEY] as string[];
+  return tmuxPanes.paneList();
 }
 
 /** Replace the tracked tmux subagent pane list. Exported for tests. */
 export function setTmuxSubagentPaneList(paneIds: string[]): void {
-  (globalThis as Record<symbol, unknown>)[TMUX_SUBAGENT_PANES_KEY] = [
-    ...paneIds,
-  ];
+  tmuxPanes.setPaneList(paneIds);
 }
 
-/**
- * Track a spawned tmux subagent pane so layout ops stay in the group
- * (idempotent).
- */
-function tmuxTrackPane(paneId: string): void {
-  const panes = tmuxSubagentPaneList();
-  if (!panes.includes(paneId)) panes.push(paneId);
-}
-
-/** Forget a tmux subagent pane after its surface closes. */
-function tmuxUntrackPane(paneId: string): void {
-  setTmuxSubagentPaneList(tmuxSubagentPaneList().filter((id) => id !== paneId));
-}
+const tmuxTrackPane = tmuxPanes.track;
+const tmuxUntrackPane = tmuxPanes.untrack;
 
 function tmuxParentRatio(): number {
   return parentRatioFromEnv("PI_SUBAGENT_TMUX_PARENT_RATIO");
@@ -2232,11 +2274,13 @@ function tmuxGroupRegion(
   parent: TmuxPaneGeometry,
   trackedPaneIds?: string[],
 ): GridRect {
-  const tracked = new Set(trackedPaneIds ?? tmuxSubagentPaneList());
-  return boundingRect([
+  return groupRegionOf(
+    panes,
     tmuxPaneRect(parent),
-    ...panes.filter((pane) => tracked.has(pane.paneId)).map(tmuxPaneRect),
-  ]);
+    (pane) => pane.paneId,
+    tmuxPaneRect,
+    trackedPaneIds ?? tmuxSubagentPaneList(),
+  );
 }
 
 /** Subagent area for tmux: right of the parent, inside the group region. */
@@ -2454,17 +2498,23 @@ export function planTmuxGridRebalance(
   if (!(region.width > 0) || !(region.height > 0)) return [];
   if (!(parent.width > 0)) return [];
 
-  // A foreign pane right of the parent inside the region (a user split in
-  // the grid area) would get wrecked by the rebalance — bail. Foreign panes
-  // elsewhere are not ours to care about.
-  const trackedSet = new Set(tracked);
+  // A foreign pane right of the parent inside the region would get wrecked by
+  // the rebalance — bail (see foreignPaneInGridArea).
   const parentRight = parent.left + parent.width;
-  const isForeignInRegion = (pane: TmuxPaneGeometry): boolean =>
-    pane.paneId !== parentPaneId &&
-    !trackedSet.has(pane.paneId) &&
-    tmuxPaneInRegion(pane, region) &&
-    pane.left >= parentRight - 1;
-  if (panes.some(isForeignInRegion)) return [];
+  if (
+    foreignPaneInGridArea(
+      panes,
+      parentPaneId,
+      tracked,
+      region,
+      parentRight,
+      (pane) => pane.paneId,
+      (pane) => pane.left,
+      (pane) => tmuxPaneInRegion(pane, region),
+    )
+  ) {
+    return [];
+  }
   const targets = planGridTargets(tracked, region, parentRatio);
   if (!targets) return [];
 
@@ -3103,57 +3153,82 @@ export function sendLongCommand(
 }
 
 /**
+ * One spec for sync and async screen reads — the five backends differ only
+ * in argv and whether the output needs tailing. Two sync-only quirks are
+ * preserved deliberately: cmux reads via a shell string (historical shape)
+ * and zellij scopes ZELLIJ_PANE_ID into the env.
+ */
+function screenReadPlan(
+  backend: MuxBackend,
+  surface: string,
+  lines: number,
+): {
+  file: string;
+  args: string[];
+  tail: boolean;
+  shell?: string;
+  env?: NodeJS.ProcessEnv;
+} {
+  switch (backend) {
+    case "cmux":
+      return {
+        file: "cmux",
+        args: ["read-screen", "--surface", surface, "--lines", String(lines)],
+        tail: false,
+        shell: `cmux read-screen --surface ${shellEscape(surface)} --lines ${lines}`,
+      };
+    case "tmux":
+      return {
+        file: "tmux",
+        args: [
+          "capture-pane",
+          "-p",
+          "-t",
+          surface,
+          "-S",
+          `-${Math.max(1, lines)}`,
+        ],
+        tail: false,
+      };
+    case "herdr":
+      return {
+        file: "herdr",
+        args: ["pane", "read", surface, "--lines", String(Math.max(1, lines))],
+        tail: false,
+      };
+    case "wezterm":
+      return {
+        file: "wezterm",
+        args: ["cli", "get-text", "--pane-id", surface],
+        tail: true,
+      };
+    case "zellij":
+      // Zellij 0.44+: dump-screen to stdout via --pane-id instead of env var
+      // + temp file. The ZELLIJ_PANE_ID env var doesn't reliably target other
+      // panes for dump-screen, and --path may silently fail to create the
+      // file. Stdout capture is robust.
+      return {
+        file: "zellij",
+        args: zellijActionArgs(["dump-screen"], surface),
+        tail: true,
+        env: zellijEnv(surface),
+      };
+  }
+}
+
+/**
  * Read the screen contents of a pane (sync).
  */
 export function readScreen(surface: string, lines = 50): string {
-  const backend = requireMuxBackend();
-
-  if (backend === "cmux") {
-    return execSync(
-      `cmux read-screen --surface ${shellEscape(surface)} --lines ${lines}`,
-      {
-        encoding: "utf8",
-      },
-    );
-  }
-
-  if (backend === "tmux") {
-    return execFileSync(
-      "tmux",
-      ["capture-pane", "-p", "-t", surface, "-S", `-${Math.max(1, lines)}`],
-      {
-        encoding: "utf8",
-      },
-    );
-  }
-
-  if (backend === "herdr") {
-    return execFileSync(
-      "herdr",
-      ["pane", "read", surface, "--lines", String(Math.max(1, lines))],
-      {
-        encoding: "utf8",
-      },
-    );
-  }
-
-  if (backend === "wezterm") {
-    const raw = execFileSync(
-      "wezterm",
-      ["cli", "get-text", "--pane-id", surface],
-      {
-        encoding: "utf8",
-      },
-    );
-    return tailLines(raw, lines);
-  }
-
-  // Zellij 0.44+: dump-screen to stdout via --pane-id instead of env var +
-  // temp file. The ZELLIJ_PANE_ID env var doesn't reliably target other panes
-  // for dump-screen, and --path may silently fail to create the file. Stdout
-  // capture is robust.
-  const raw = zellijActionSync(["dump-screen"], surface);
-  return tailLines(raw, lines);
+  const plan = screenReadPlan(requireMuxBackend(), surface, lines);
+  const raw =
+    plan.shell !== undefined
+      ? execSync(plan.shell, { encoding: "utf8" })
+      : execFileSync(plan.file, plan.args, {
+          encoding: "utf8",
+          env: plan.env,
+        });
+  return plan.tail ? tailLines(raw, lines) : raw;
 }
 
 /**
@@ -3163,55 +3238,11 @@ export async function readScreenAsync(
   surface: string,
   lines = 50,
 ): Promise<string> {
-  const backend = requireMuxBackend();
-
-  if (backend === "cmux") {
-    const { stdout } = await execFileAsync(
-      "cmux",
-      ["read-screen", "--surface", surface, "--lines", String(lines)],
-      { encoding: "utf8" },
-    );
-    return stdout;
-  }
-
-  if (backend === "tmux") {
-    const { stdout } = await execFileAsync(
-      "tmux",
-      ["capture-pane", "-p", "-t", surface, "-S", `-${Math.max(1, lines)}`],
-      { encoding: "utf8" },
-    );
-    return stdout;
-  }
-
-  if (backend === "herdr") {
-    const { stdout } = await execFileAsync(
-      "herdr",
-      ["pane", "read", surface, "--lines", String(Math.max(1, lines))],
-      { encoding: "utf8" },
-    );
-    return stdout;
-  }
-
-  if (backend === "wezterm") {
-    const { stdout } = await execFileAsync(
-      "wezterm",
-      ["cli", "get-text", "--pane-id", surface],
-      {
-        encoding: "utf8",
-      },
-    );
-    return tailLines(stdout, lines);
-  }
-
-  // Zellij 0.44+: dump-screen to stdout via --pane-id (see readScreen).
-  const { stdout } = await execFileAsync(
-    "zellij",
-    zellijActionArgs(["dump-screen"], surface),
-    {
-      encoding: "utf8",
-    },
-  );
-  return tailLines(stdout, lines);
+  const plan = screenReadPlan(requireMuxBackend(), surface, lines);
+  const { stdout } = await execFileAsync(plan.file, plan.args, {
+    encoding: "utf8",
+  });
+  return plan.tail ? tailLines(stdout, lines) : stdout;
 }
 
 /**
