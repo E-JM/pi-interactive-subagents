@@ -375,11 +375,6 @@ export function closeRunningSubagent(
 }
 
 /**
- * Waiting-delivery + idle auto-close supervision for one running subagent.
- * Called from the 1s supervision interval for every running entry, independent
- * of the status widget config.
- */
-/**
  * Idle ms since the run started waiting, or null when this tick cannot
  * evaluate completion at all (wrong kind of subagent, run still active, no
  * time reference).
@@ -483,6 +478,11 @@ function deliverWaitingResult(
   running.exitSteerSuppressed = true;
 }
 
+/**
+ * Waiting-delivery + idle auto-close supervision for one running subagent.
+ * Called from the 1s supervision interval for every running entry, independent
+ * of the status widget config.
+ */
 export function superviseRunCompletion(
   pi: ExtensionAPI,
   running: RunningSubagent,
@@ -714,7 +714,6 @@ export async function watchSubagent(
     const elapsed = elapsedSeconds(startTime);
 
     if (running.cli === "claude") {
-      // Claude Code result extraction
       let summary = "";
 
       if (running.sentinelFile) {
@@ -740,7 +739,6 @@ export async function watchSubagent(
             : "Claude Code exited without output";
       }
 
-      // Copy Claude session transcript
       let sessionId: string | null = null;
       if (running.sentinelFile) {
         sessionId = copyClaudeSession(running.sentinelFile);
@@ -765,7 +763,6 @@ export async function watchSubagent(
       };
     }
 
-    // Pi subagent result extraction
     const allEntries = existsSync(sessionFile)
       ? getNewEntries(sessionFile, 0)
       : [];

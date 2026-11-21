@@ -121,7 +121,6 @@ export default function (pi: ExtensionAPI) {
           : "";
 
         if (expanded) {
-          // Expanded: full tool list + denied
           const countInfo = theme.fg("dim", ` — ${toolNames.length} available`);
           const hint = theme.fg("muted", "  (Ctrl+J to collapse)");
 
@@ -144,7 +143,6 @@ export default function (pi: ExtensionAPI) {
           );
           box.addChild(content);
         } else {
-          // Collapsed: one-line summary
           const countInfo = theme.fg("dim", ` — ${toolNames.length} tools`);
           const deniedInfo =
             denied.length > 0
@@ -271,7 +269,6 @@ export default function (pi: ExtensionAPI) {
     recorder.sessionShutdown();
   });
 
-  // Toggle expand/collapse with Ctrl+J
   pi.registerShortcut("ctrl+j", {
     description: "Toggle subagent tools widget",
     handler: (ctx) => {

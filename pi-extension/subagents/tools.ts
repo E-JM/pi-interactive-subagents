@@ -253,7 +253,6 @@ export function registerSubagentSpawnTool(
           };
         }
 
-        // Validate prerequisites
         if (!isMuxAvailable()) {
           return muxUnavailableResult();
         }
@@ -270,7 +269,6 @@ export function registerSubagentSpawnTool(
           };
         }
 
-        // Launch the subagent (creates pane, sends command)
         const running = await launchSubagent(params, ctx);
 
         // Fire-and-forget: the watcher's .then() steers the result later.
@@ -344,12 +342,10 @@ export function registerSubagentSpawnTool(
         const details = detailsOf(result.details);
         const name = details.name ?? "(unnamed)";
 
-        // "Started" result — tool returned immediately
         if (details.status === "started") {
           return targetCallText(name, theme, "started");
         }
 
-        // Fallback (shouldn't happen)
         return renderResultFallback(result, theme);
       },
     });
@@ -515,7 +511,6 @@ export function registerSubagentMessageTool(
           return targetCallText(name, theme, "resumed");
         }
 
-        // Fallback
         return renderResultFallback(result, theme);
       },
 
@@ -653,7 +648,6 @@ export function registerSubagentMessageTool(
           ],
         });
 
-        // Register as a running subagent for widget tracking, then watch it.
         const running = createRunningSubagent({
           id,
           name,

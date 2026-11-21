@@ -294,7 +294,6 @@ function createSurfaceInPane(name: string, pane: string): string {
  */
 export function createCmuxSubagentSurface(name: string): string {
   if (cmuxSubagentPane) {
-    // Verify the pane still exists before adding a tab to it
     try {
       const tree = execSync(`cmux tree`, { encoding: "utf8" });
       if (tree.includes(cmuxSubagentPane)) {

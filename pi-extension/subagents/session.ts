@@ -89,14 +89,6 @@ export function getNewEntries(
   return lines.slice(afterLine).map((line) => JSON.parse(line) as SessionEntry);
 }
 
-/**
- * Find the last assistant message text in a list of entries.
- *
- * Falls back to the `errorMessage` field when the last assistant message has
- * `stopReason: "error"` and no usable text content — this happens when
- * auto-retry exhausts on a provider overload / rate limit / server error, and
- * without this fallback the parent would silently see a stale earlier message.
- */
 /** Non-empty text blocks of an assistant message, in order. */
 function assistantTexts(msg: MessageEntry): string[] {
   return msg.message.content
@@ -123,6 +115,14 @@ function assistantErrorText(msg: MessageEntry): string | null {
   return null;
 }
 
+/**
+ * Find the last assistant message text in a list of entries.
+ *
+ * Falls back to the `errorMessage` field when the last assistant message has
+ * `stopReason: "error"` and no usable text content — this happens when
+ * auto-retry exhausts on a provider overload / rate limit / server error, and
+ * without this fallback the parent would silently see a stale earlier message.
+ */
 export function findLastAssistantMessage(
   entries: SessionEntry[],
 ): string | null {

@@ -4,8 +4,6 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-// --- Subagent layout mode (columns vs tiled grid, herdr/tmux only) ---
-
 export type SubagentLayoutMode = "columns" | "tiled";
 
 const LAYOUT_MODE_KEY = Symbol.for("pi-subagents/layout-mode");

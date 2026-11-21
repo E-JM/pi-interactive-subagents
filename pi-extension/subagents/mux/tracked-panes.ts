@@ -1,5 +1,3 @@
-// Pane-id tracking shared by herdr and tmux.
-
 /**
  * Pane-id tracking shared by herdr and tmux: globalThis + Symbol.for so the
  * list survives /reload; ids stay in spawn order (grid fill order).

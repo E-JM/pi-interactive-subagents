@@ -443,7 +443,6 @@ export function createZellijSplitSurface(
   direction: "left" | "right" | "up" | "down",
   fromSurface?: string,
 ): string {
-  // zellij
   const directionArg =
     direction === "left" || direction === "right" ? "right" : "down";
   const args = [

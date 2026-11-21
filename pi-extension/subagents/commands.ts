@@ -156,7 +156,6 @@ export function registerSubagentCommands(pi: ExtensionAPI): void {
         return;
       }
 
-      // Rename workspace and tab to show this is a planning session
       if (isMuxAvailable()) {
         try {
           const label = task.length > 40 ? `${task.slice(0, 40)}...` : task;
@@ -167,7 +166,6 @@ export function registerSubagentCommands(pi: ExtensionAPI): void {
         }
       }
 
-      // Load the plan skill from the subagents extension directory
       const planSkillPath = join(SUBAGENTS_DIR, "plan-skill.md");
       let content = readFileSync(planSkillPath, "utf8");
       content = content.replace(/^---\n[\s\S]*?\n---\n*/, "");

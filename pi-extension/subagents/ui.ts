@@ -142,8 +142,7 @@ export function borderLine(left: string, right: string, width: number): string {
   if (width <= 0) return "";
   if (width === 1) return `${ACCENT}│${RST}`;
 
-  // width = total visible chars for the whole line including │ and │
-  const contentWidth = Math.max(0, width - 2); // space inside the two │ chars
+  const contentWidth = Math.max(0, width - 2);
   const rightVis = visibleWidth(right);
 
   // Prefer a compact right chunk over overflowing the terminal.
@@ -160,16 +159,12 @@ export function borderLine(left: string, right: string, width: number): string {
   return `${ACCENT}│${RST}${truncLeft}${" ".repeat(pad)}${right}${ACCENT}│${RST}`;
 }
 
-/**
- * Build the bordered top line: ╭─ Title ──── info ─╮
- * All chars are accounted for within `width`.
- */
+/** Top border: ╭─ Title ──── info ─╮ — all chars accounted for within `width`. */
 function borderTop(title: string, info: string, width: number): string {
   if (width <= 0) return "";
   if (width === 1) return `${ACCENT}╭${RST}`;
 
-  // ╭─ Title ───...─── info ─╮
-  const inner = Math.max(0, width - 2); // inside ╭ and ╮
+  const inner = Math.max(0, width - 2);
   const titlePart = `─ ${title} `;
   const infoPart = ` ${info} ─`;
   const fillLen = Math.max(0, inner - titlePart.length - infoPart.length);
@@ -180,9 +175,6 @@ function borderTop(title: string, info: string, width: number): string {
   return `${ACCENT}╭${content}╮${RST}`;
 }
 
-/**
- * Build the bordered bottom line: ╰──────────────────╯
- */
 function borderBottom(width: number): string {
   if (width <= 0) return "";
   if (width === 1) return `${ACCENT}╰${RST}`;
@@ -330,11 +322,9 @@ export function registerSubagentMessageRenderers(pi: ExtensionAPI): void {
           .replace(`${resultLabelWaiting(name, elapsed)}\n\n`, "")
           .replace(`${resultLabelProviderError(name, elapsed)}\n\n`, "");
 
-        // Build content for the box
         const contentLines = [header];
 
         if (options.expanded) {
-          // Full view: complete summary + session info
           if (summary) {
             for (const line of summary.split("\n")) {
               contentLines.push(line.slice(0, width - 6));
@@ -350,7 +340,6 @@ export function registerSubagentMessageRenderers(pi: ExtensionAPI): void {
             );
           }
         } else {
-          // Collapsed: preview + expand hint
           if (summary) {
             const previewLines = summary.split("\n").slice(0, 5);
             for (const line of previewLines) {
@@ -366,7 +355,6 @@ export function registerSubagentMessageRenderers(pi: ExtensionAPI): void {
           contentLines.push(expandHint(theme));
         }
 
-        // Render via Box for background + padding, with blank line above for separation
         return renderBoxLines(contentLines, bgFn, width);
       },
     };
