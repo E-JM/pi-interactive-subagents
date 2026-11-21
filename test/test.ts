@@ -5558,23 +5558,63 @@ describe("launch command primitives", () => {
   });
 
   it("assembles the pi invocation: cd + env + session + subagent-done + args + DONE marker", () => {
-    const command = testApi.buildPiInvocation({
-      sessionFile: "/tmp/s.jsonl",
-      envPrefix: "PI_SUBAGENT_NAME='W' ",
-      escapedArgs: [
-        "--model",
-        "'anthropic/claude-haiku-4-5'",
-        "'@/tmp/task.md'",
-      ],
-      effectiveCwd: "/home/user/proj",
+    // Pin the mux away from herdr so the herdr-only `--tui-mode regular`
+    // injection stays out of this pin regardless of the host terminal
+    // (tmux hosts resolve the preference, herdr hosts fall back to null).
+    process.env.PI_SUBAGENT_MUX = "tmux";
+    try {
+      const command = testApi.buildPiInvocation({
+        sessionFile: "/tmp/s.jsonl",
+        envPrefix: "PI_SUBAGENT_NAME='W' ",
+        escapedArgs: [
+          "--model",
+          "'anthropic/claude-haiku-4-5'",
+          "'@/tmp/task.md'",
+        ],
+        effectiveCwd: "/home/user/proj",
+      });
+      assert.equal(
+        command,
+        "cd '/home/user/proj' && PI_SUBAGENT_NAME='W' " +
+          `pi --session '/tmp/s.jsonl' -e '${subagentDonePath}' ` +
+          "--model 'anthropic/claude-haiku-4-5' '@/tmp/task.md'; " +
+          "echo '__SUBAGENT_DONE_'$?'__'",
+      );
+    } finally {
+      delete process.env.PI_SUBAGENT_MUX;
+    }
+  });
+
+  it("forces --tui-mode regular on herdr (alt-screen breaks the exit poll)", () => {
+    // herdr runtime availability needs the env trio plus a herdr on PATH;
+    // stub the binary so this pin holds on hosts that never run herdr.
+    const stubBin = mkdtempSync(join(tmpdir(), "pi-stub-bin-"));
+    writeFileSync(join(stubBin, "herdr"), "#!/bin/sh\nexit 0\n", {
+      mode: 0o755,
     });
-    assert.equal(
-      command,
-      "cd '/home/user/proj' && PI_SUBAGENT_NAME='W' " +
-        `pi --session '/tmp/s.jsonl' -e '${subagentDonePath}' ` +
-        "--model 'anthropic/claude-haiku-4-5' '@/tmp/task.md'; " +
-        "echo '__SUBAGENT_DONE_'$?'__'",
-    );
+    const savedPath = process.env.PATH;
+    process.env.PATH = `${stubBin}:${savedPath}`;
+    process.env.PI_SUBAGENT_MUX = "herdr";
+    process.env.HERDR_ENV = "1";
+    process.env.HERDR_PANE_ID = "stub:p1";
+    try {
+      const command = testApi.buildPiInvocation({
+        sessionFile: "/tmp/s.jsonl",
+        envPrefix: "PI_SUBAGENT_NAME='W' ",
+        escapedArgs: [],
+        effectiveCwd: "/home/user/proj",
+      });
+      assert.match(
+        command,
+        / pi --session '\/tmp\/s\.jsonl' --tui-mode regular /,
+      );
+    } finally {
+      process.env.PATH = savedPath;
+      delete process.env.PI_SUBAGENT_MUX;
+      delete process.env.HERDR_ENV;
+      delete process.env.HERDR_PANE_ID;
+      rmSync(stubBin, { recursive: true, force: true });
+    }
   });
 
   it("builds the claude invocation with sentinel, plugin dir, and params-over-defaults prompt", () => {
