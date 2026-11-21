@@ -92,20 +92,8 @@ const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
 const globalStore = globalThis as Record<symbol, unknown>;
 
 {
-  const prevInterval = globalStore[WIDGET_INTERVAL_KEY] as
-    | ReturnType<typeof setInterval>
-    | undefined;
-  if (prevInterval) {
-    clearInterval(prevInterval);
-    globalStore[WIDGET_INTERVAL_KEY] = null;
-  }
-  const prevStatusInterval = globalStore[STATUS_INTERVAL_KEY] as
-    | ReturnType<typeof setInterval>
-    | undefined;
-  if (prevStatusInterval) {
-    clearInterval(prevStatusInterval);
-    globalStore[STATUS_INTERVAL_KEY] = null;
-  }
+  clearStoredInterval(WIDGET_INTERVAL_KEY);
+  clearStoredInterval(STATUS_INTERVAL_KEY);
   const prevAbort = globalStore[POLL_ABORT_KEY] as AbortController | undefined;
   if (prevAbort) prevAbort.abort();
   globalStore[POLL_ABORT_KEY] = new AbortController();
@@ -114,6 +102,25 @@ const globalStore = globalThis as Record<symbol, unknown>;
 function getModuleAbortSignal(): AbortSignal {
   return (globalStore[POLL_ABORT_KEY] as AbortController).signal;
 }
+
+/**
+ * The symbol-keyed globalStore slots are the single home for the interval
+ * handles: closures from an older module load still see the same slots, so
+ * /reload teardown and runtime teardown both act on the same timer.
+ */
+function getStoredInterval(key: symbol): IntervalHandle | null {
+  return (globalStore[key] as IntervalHandle | null | undefined) ?? null;
+}
+
+function clearStoredInterval(key: symbol): void {
+  const handle = getStoredInterval(key);
+  if (handle) {
+    clearInterval(handle);
+    globalStore[key] = null;
+  }
+}
+
+type IntervalHandle = ReturnType<typeof setInterval>;
 
 const SubagentParams = Type.Object({
   name: Type.String({ description: "Display name for the subagent" }),
@@ -859,12 +866,6 @@ const runningSubagents = new Map<string, RunningSubagent>();
 /** Latest ExtensionContext from session_start, used for widget updates. */
 let latestCtx: ExtensionContext | null = null;
 
-/** Interval timer for widget re-renders. */
-let widgetInterval: ReturnType<typeof setInterval> | null = null;
-
-/** Interval timer for status transition checks. */
-let supervisionInterval: ReturnType<typeof setInterval> | null = null;
-
 function formatElapsedMMSS(startTime: number): string {
   const seconds = Math.floor((Date.now() - startTime) / 1000);
   const m = Math.floor(seconds / 60);
@@ -966,11 +967,7 @@ function updateWidget() {
 
   if (runningSubagents.size === 0) {
     latestCtx.ui.setWidget("subagent-status", undefined);
-    if (widgetInterval) {
-      clearInterval(widgetInterval);
-      widgetInterval = null;
-      globalStore[WIDGET_INTERVAL_KEY] = null;
-    }
+    clearStoredInterval(WIDGET_INTERVAL_KEY);
     return;
   }
 
@@ -1560,15 +1557,11 @@ function superviseRunCompletion(
  * status widget config is disabled).
  */
 function startSupervisionLoop(pi: ExtensionAPI) {
-  if (supervisionInterval) return;
+  if (getStoredInterval(STATUS_INTERVAL_KEY)) return;
 
-  supervisionInterval = setInterval(() => {
+  globalStore[STATUS_INTERVAL_KEY] = setInterval(() => {
     if (runningSubagents.size === 0) {
-      if (supervisionInterval) {
-        clearInterval(supervisionInterval);
-        supervisionInterval = null;
-        globalStore[STATUS_INTERVAL_KEY] = null;
-      }
+      clearStoredInterval(STATUS_INTERVAL_KEY);
       return;
     }
 
@@ -1618,8 +1611,6 @@ function startSupervisionLoop(pi: ExtensionAPI) {
       );
     }
   }, 1000);
-
-  globalStore[STATUS_INTERVAL_KEY] = supervisionInterval;
 }
 
 function resolveResumeLaunchBehavior(params: { autoExit?: boolean }): {
@@ -1722,12 +1713,11 @@ function detailsOf(value: unknown): SubagentDetailsPayload {
 }
 
 function startWidgetRefresh() {
-  if (widgetInterval) return;
+  if (getStoredInterval(WIDGET_INTERVAL_KEY)) return;
   updateWidget(); // immediate first render
-  widgetInterval = setInterval(() => {
+  globalStore[WIDGET_INTERVAL_KEY] = setInterval(() => {
     updateWidget();
   }, 1000);
-  globalStore[WIDGET_INTERVAL_KEY] = widgetInterval;
 }
 
 /**
@@ -3206,16 +3196,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
   // Clean up on session shutdown
   pi.on("session_shutdown", (_event, _ctx) => {
-    if (widgetInterval) {
-      clearInterval(widgetInterval);
-      widgetInterval = null;
-      globalStore[WIDGET_INTERVAL_KEY] = null;
-    }
-    if (supervisionInterval) {
-      clearInterval(supervisionInterval);
-      supervisionInterval = null;
-      globalStore[STATUS_INTERVAL_KEY] = null;
-    }
+    clearStoredInterval(WIDGET_INTERVAL_KEY);
+    clearStoredInterval(STATUS_INTERVAL_KEY);
     const moduleAbort = globalStore[POLL_ABORT_KEY] as
       | AbortController
       | undefined;
