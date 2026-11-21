@@ -13,6 +13,7 @@ import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@mariozechner/pi-tui";
+import { initTheme } from "@mariozechner/pi-coding-agent";
 import {
   createSubagentActivityRecorder,
   getSubagentActivityFile,
@@ -2264,6 +2265,57 @@ describe("tool execute error paths", () => {
       .join("\n");
     assert.match(rendered, /scout/);
     assert.match(rendered, /Which API should I use\?/);
+  });
+
+  it("subagent_result collapsed view previews 5 lines and hints at the rest", () => {
+    initTheme(); // collapsed views render the keyHint() expand line
+    const mock = boot();
+    const entry = mock.registeredMessageRenderers.find(
+      (e) => e.name === "subagent_result",
+    );
+    assert.ok(entry, "expected subagent_result renderer");
+    const summary = ["l1", "l2", "l3", "l4", "l5", "l6", "l7"].join("\n");
+    const rendered = entry
+      .renderer(
+        {
+          customType: "subagent_result",
+          content: `Sub-agent "worker" completed (42s).\n\n${summary}`,
+          details: { name: "worker", task: "t", elapsed: 42, exitCode: 0 },
+        },
+        { expanded: false },
+        theme,
+      )
+      .render(80)
+      .join("\n");
+    assert.match(rendered, /l1/);
+    assert.match(rendered, /l5/);
+    assert.doesNotMatch(rendered, /l6/);
+    assert.match(rendered, /… 2 more lines/);
+  });
+
+  it("subagent_ping collapsed view previews the first message line only", () => {
+    initTheme(); // collapsed views render the keyHint() expand line
+    const mock = boot();
+    const entry = mock.registeredMessageRenderers.find(
+      (e) => e.name === "subagent_ping",
+    );
+    assert.ok(entry, "expected subagent_ping renderer");
+    const rendered = entry
+      .renderer(
+        {
+          customType: "subagent_ping",
+          details: {
+            name: "scout",
+            message: "First line of the question\nsecond line",
+          },
+        },
+        { expanded: false },
+        theme,
+      )
+      .render(80)
+      .join("\n");
+    assert.match(rendered, /First line of the question/);
+    assert.doesNotMatch(rendered, /second line/);
   });
 });
 
@@ -5619,5 +5671,32 @@ describe("launch command primitives", () => {
       interactive: false,
     });
     assert.ok(autoExit.includes("Complete your task autonomously."));
+  });
+});
+
+describe("getShellReadyDelayMs", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  it("returns 500 by default and honors a valid override", () => {
+    const prev = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
+    try {
+      delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
+      assert.equal(testApi.getShellReadyDelayMs(), 500);
+
+      process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "2500";
+      assert.equal(testApi.getShellReadyDelayMs(), 2500);
+
+      process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "not-a-number";
+      assert.equal(testApi.getShellReadyDelayMs(), 500);
+
+      process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "-5";
+      assert.equal(testApi.getShellReadyDelayMs(), 500);
+    } finally {
+      if (prev === undefined) {
+        delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
+      } else {
+        process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = prev;
+      }
+    }
   });
 });
