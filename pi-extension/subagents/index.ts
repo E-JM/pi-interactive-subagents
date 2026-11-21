@@ -44,7 +44,6 @@ import {
   getSubagentLayoutMode,
   isMuxAvailable,
   muxSetupHint,
-  pollForExit,
   readScreen,
   renameCurrentTab,
   renameWorkspace,
@@ -55,6 +54,7 @@ import {
   setSubagentLayoutMode,
   shellEscape,
 } from "./cmux.ts";
+import { pollForExit } from "./exit-poll.ts";
 import {
   findLastAssistantIndex,
   findLastAssistantMessage,

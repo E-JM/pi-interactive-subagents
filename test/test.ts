@@ -19,7 +19,6 @@ import {
   readSubagentActivityFile,
 } from "../pi-extension/subagents/activity.ts";
 import {
-  __pollForExitTest__,
   canSplitZellijPane,
   getSubagentLayoutMode,
   gridDimsForCount,
@@ -51,6 +50,7 @@ import {
   setTmuxSubagentPaneList,
   shellEscape,
 } from "../pi-extension/subagents/cmux.ts";
+import { __pollForExitTest__ } from "../pi-extension/subagents/exit-poll.ts";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 import {
   appendBranchSummary,
