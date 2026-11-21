@@ -5566,3 +5566,161 @@ describe("sanitizeInjectedMessage", () => {
     assert.equal(sanitizeInjectedMessage("y".repeat(4_000)), "y".repeat(4_000));
   });
 });
+
+describe("launch command primitives", () => {
+  const testApi = (subagentsModule as any).__test__;
+  const subagentDonePath = fileURLToPath(
+    new URL("../pi-extension/subagents/subagent-done.ts", import.meta.url),
+  );
+
+  it("builds the shared subagent env prefix in one fixed order", () => {
+    const prefix = testApi.buildSubagentEnvPrefix({
+      name: "Scout: Auth",
+      sessionFile: "/tmp/s.jsonl",
+      id: "ab12cd34",
+      activityFile: "/tmp/act.json",
+      agent: "scout",
+      surface: "pane.1",
+      autoExit: true,
+      denyTools: new Set(["bash", "write"]),
+      agentConfigDir: "/cfg",
+    });
+    assert.equal(
+      prefix,
+      "PI_CODING_AGENT_DIR='/cfg' PI_DENY_TOOLS='bash,write' " +
+        "PI_SUBAGENT_NAME='Scout: Auth' PI_SUBAGENT_AGENT='scout' " +
+        "PI_SUBAGENT_AUTO_EXIT=1 PI_SUBAGENT_SESSION='/tmp/s.jsonl' " +
+        "PI_SUBAGENT_ID='ab12cd34' PI_SUBAGENT_ACTIVITY_FILE='/tmp/act.json' " +
+        "PI_SUBAGENT_SURFACE='pane.1' ",
+    );
+  });
+
+  it("omits optional env assignments entirely when unspecified", () => {
+    assert.equal(
+      testApi.buildSubagentEnvPrefix({
+        name: "W",
+        sessionFile: "/s",
+        id: "i",
+        activityFile: "/a",
+      }),
+      "PI_SUBAGENT_NAME='W' PI_SUBAGENT_SESSION='/s' " +
+        "PI_SUBAGENT_ID='i' PI_SUBAGENT_ACTIVITY_FILE='/a' ",
+    );
+  });
+
+  it("assembles the pi invocation: cd + env + session + subagent-done + args + DONE marker", () => {
+    const command = testApi.buildPiInvocation({
+      sessionFile: "/tmp/s.jsonl",
+      envPrefix: "PI_SUBAGENT_NAME='W' ",
+      escapedArgs: [
+        "--model",
+        "'anthropic/claude-haiku-4-5'",
+        "'@/tmp/task.md'",
+      ],
+      effectiveCwd: "/home/user/proj",
+    });
+    assert.equal(
+      command,
+      "cd '/home/user/proj' && PI_SUBAGENT_NAME='W' " +
+        `pi --session '/tmp/s.jsonl' -e '${subagentDonePath}' ` +
+        "--model 'anthropic/claude-haiku-4-5' '@/tmp/task.md'; " +
+        "echo '__SUBAGENT_DONE_'$?'__'",
+    );
+  });
+
+  it("builds the claude invocation with sentinel, plugin dir, and params-over-defaults prompt", () => {
+    const { command, sentinelFile } = testApi.buildClaudeCommand({
+      id: "ab12cd34",
+      task: "do the thing",
+      systemPrompt: "PROMPT",
+      resumeSessionId: "sess-1",
+      model: "claude-sonnet-4",
+      agentBody: "You are Scout.",
+      effectiveCwd: "/w",
+    });
+    assert.equal(sentinelFile, "/tmp/pi-claude-ab12cd34-done");
+    assert.ok(command.startsWith("cd '/w' && "));
+    assert.ok(
+      command.includes("PI_CLAUDE_SENTINEL='/tmp/pi-claude-ab12cd34-done'"),
+    );
+    assert.ok(command.includes("claude --dangerously-skip-permissions"));
+    // The repo ships pi-extension/subagents/plugin, so the flag is present.
+    assert.ok(command.includes("--plugin-dir"));
+    assert.ok(command.includes("--model 'claude-sonnet-4'"));
+    // params.systemPrompt wins over the agent-file body on the claude path.
+    assert.ok(command.includes("--append-system-prompt 'PROMPT'"));
+    assert.ok(command.includes("--resume 'sess-1'"));
+    assert.ok(
+      command.endsWith("'do the thing'; echo '__SUBAGENT_DONE_'$?'__'"),
+    );
+  });
+
+  it("falls back to error/exit/placeholder summaries in order", () => {
+    assert.equal(
+      testApi.exitSummaryFallback({
+        exitCode: 0,
+        errorMessage: "overloaded",
+      }),
+      "Subagent error: overloaded",
+    );
+    assert.equal(
+      testApi.exitSummaryFallback({ exitCode: 3 }),
+      "Sub-agent exited with code 3",
+    );
+    assert.equal(
+      testApi.exitSummaryFallback({ exitCode: 0 }),
+      "Sub-agent exited without output",
+    );
+    assert.equal(
+      testApi.exitSummaryFallback(
+        { exitCode: 0 },
+        "Resumed session",
+        "new output",
+      ),
+      "Resumed session exited without new output",
+    );
+  });
+
+  it("returns the bare task for fork mode and wraps blank-session tasks per delivery lane", () => {
+    assert.equal(
+      testApi.composeFullTask({
+        task: "T",
+        roleBlock: "\n\nR",
+        inheritsConversationContext: true,
+        autoExit: false,
+        interactive: true,
+      }),
+      "T",
+    );
+
+    const interactive = testApi.composeFullTask({
+      task: "T",
+      roleBlock: "\n\nIDENT",
+      inheritsConversationContext: false,
+      autoExit: false,
+      interactive: true,
+    });
+    assert.ok(interactive.startsWith("\n\nIDENT\n\n"));
+    assert.ok(interactive.includes("call the subagent_done tool"));
+    assert.ok(interactive.includes("T\n\nYour FINAL assistant message"));
+
+    const autonomous = testApi.composeFullTask({
+      task: "T",
+      roleBlock: "",
+      inheritsConversationContext: false,
+      autoExit: false,
+      interactive: false,
+    });
+    assert.ok(autonomous.includes("end your turn with a clear summary"));
+    assert.ok(autonomous.includes("Do NOT call subagent_done"));
+
+    const autoExit = testApi.composeFullTask({
+      task: "T",
+      roleBlock: "",
+      inheritsConversationContext: false,
+      autoExit: true,
+      interactive: false,
+    });
+    assert.ok(autoExit.includes("Complete your task autonomously."));
+  });
+});
