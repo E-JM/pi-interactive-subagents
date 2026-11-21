@@ -418,7 +418,7 @@ function resolveEffectiveSessionMode(
  * Thinking suffixes are dropped on fallback: the agent's tuned level may not
  * be valid on the parent's model.
  */
-export interface ModelFallbackDecision {
+interface ModelFallbackDecision {
   model?: string;
   warning?: string;
   /** Whether the agent's `thinking` frontmatter may be appended (true unless
@@ -426,7 +426,7 @@ export interface ModelFallbackDecision {
   applyThinking: boolean;
 }
 
-export function resolveModelWithFallback(params: {
+function resolveModelWithFallback(params: {
   requestedModel?: string;
   hasAuth: (provider: string, modelId: string) => boolean;
   parentModel?: string;
@@ -1104,7 +1104,7 @@ function observeRunningSubagent(
  * whitespace runs containing newlines into single spaces (pane send is
  * line-oriented), trim, and hard-cap at 4000 chars.
  */
-export function sanitizeInjectedMessage(message: string): string {
+function sanitizeInjectedMessage(message: string): string {
   const collapsed = message.replace(/\s*\n\s*/g, " ").trim();
   const MAX_INJECTED_MESSAGE_LENGTH = 4000;
   if (collapsed.length <= MAX_INJECTED_MESSAGE_LENGTH) return collapsed;
@@ -1125,7 +1125,7 @@ export function sanitizeInjectedMessage(message: string): string {
  *   (an injected or typed message waiting for the child's turn) never
  *   re-steer the old closing text.
  */
-export function shouldDeliverWaitingResult(
+function shouldDeliverWaitingResult(
   params: {
     interactive: boolean;
     interruptRequested?: boolean;
@@ -1175,7 +1175,7 @@ export function shouldDeliverWaitingResult(
  * (`deliveredWaitingSince === waitingSinceMs`) and never fires for
  * interactive or interrupted runs. `idleCloseMs: 0` disables auto-close.
  */
-export function shouldIdleClose(
+function shouldIdleClose(
   params: {
     interactive: boolean;
     interruptRequested?: boolean;
@@ -1675,8 +1675,6 @@ export const __test__ = {
   resolveModelWithFallback,
   buildSubagentToolAllowlist,
   buildPiPromptArgs,
-  formatWidgetRightLabel,
-  observeRunningSubagent,
   resolveDenyTools,
   resolveRunningTarget,
   requestSubagentInterrupt,
@@ -1689,7 +1687,6 @@ export const __test__ = {
   shouldDeliverWaitingResult,
   shouldIdleClose,
   runningSubagents,
-  formatElapsed,
 };
 
 /**
@@ -2314,7 +2311,6 @@ function registerSubagentSpawnTool(
   pi: ExtensionAPI,
   shouldRegister: (name: string) => boolean,
 ): void {
-  if (!shouldRegister("subagent")) return;
   if (shouldRegister("subagent"))
     pi.registerTool({
       name: "subagent",
@@ -2464,7 +2460,6 @@ function registerSubagentInterruptTool(
   pi: ExtensionAPI,
   shouldRegister: (name: string) => boolean,
 ): void {
-  if (!shouldRegister("subagent_interrupt")) return;
   if (shouldRegister("subagent_interrupt"))
     pi.registerTool({
       name: "subagent_interrupt",
@@ -2513,7 +2508,6 @@ function registerSubagentsListTool(
   pi: ExtensionAPI,
   shouldRegister: (name: string) => boolean,
 ): void {
-  if (!shouldRegister("subagents_list")) return;
   if (shouldRegister("subagents_list"))
     pi.registerTool({
       name: "subagents_list",
@@ -2575,7 +2569,6 @@ function registerSubagentMessageTool(
   pi: ExtensionAPI,
   shouldRegister: (name: string) => boolean,
 ): void {
-  if (!shouldRegister("subagent_message")) return;
   if (shouldRegister("subagent_message"))
     pi.registerTool({
       name: "subagent_message",
@@ -2871,7 +2864,6 @@ function registerSubagentCloseTool(
   pi: ExtensionAPI,
   shouldRegister: (name: string) => boolean,
 ): void {
-  if (!shouldRegister("subagent_close")) return;
   if (shouldRegister("subagent_close"))
     pi.registerTool({
       name: "subagent_close",
@@ -3251,12 +3243,4 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   registerSubagentCloseTool(pi, shouldRegister);
   registerSubagentCommands(pi);
   registerSubagentMessageRenderers(pi);
-
-  // /iterate command — fork the session into a subagent
-
-  // /subagent command — spawn a subagent by name
-
-  // /subagent-layout command — pick subagent pane layout (herdr/tmux)
-
-  // /plan command — start the full planning workflow
 }
