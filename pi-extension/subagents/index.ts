@@ -538,6 +538,18 @@ function formatElapsed(seconds: number): string {
   return `${m}m ${s}s`;
 }
 
+/** Whole seconds elapsed since `startTime`. */
+function elapsedSeconds(startTime: number): number {
+  return Math.floor((Date.now() - startTime) / 1000);
+}
+
+/** Random hex fragment, e.g. randomHex(8) -> "1a2b3c4d". */
+function randomHex(count: number): string {
+  return Math.random()
+    .toString(16)
+    .slice(2, 2 + count);
+}
+
 /** Human-readable message for an unknown thrown value. */
 function errorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
@@ -628,13 +640,8 @@ function resultLabelProviderError(name: string, elapsedText: string): string {
   return `Sub-agent "${name}" failed after ${elapsedText} (provider/agent error — auto-retry exhausted).`;
 }
 
-/** "▸ <target> — <action>" call header shared by the target-taking tools. */
-function renderTargetCall(
-  args: { id?: string; name?: string },
-  theme: Theme,
-  action: string,
-) {
-  const target = args.id ? `${args.id}` : (args.name ?? "(unknown)");
+/** "▸ <target> — <action>" line shared by the target-taking tools' renderers. */
+function targetCallText(target: string, theme: Theme, action: string): Text {
   return new Text(
     theme.fg("accent", "▸") +
       " " +
@@ -645,6 +652,16 @@ function renderTargetCall(
   );
 }
 
+/** Call header variant resolving the target from tool-call args. */
+function renderTargetCall(
+  args: { id?: string; name?: string },
+  theme: Theme,
+  action: string,
+) {
+  const target = args.id ? `${args.id}` : (args.name ?? "(unknown)");
+  return targetCallText(target, theme, action);
+}
+
 /** Dim text fallback when a tool result carries no presentable details. */
 function renderResultFallback(
   result: { content: Array<{ text?: unknown }> },
@@ -653,6 +670,11 @@ function renderResultFallback(
   const text =
     typeof result.content[0]?.text === "string" ? result.content[0].text : "";
   return new Text(theme.fg("dim", text as string), 0, 0);
+}
+
+/** Collapsed-view hint line shared by the subagent message renderers. */
+function expandHint(theme: Theme): string {
+  return theme.fg("muted", keyHint("app.tools.expand", "to expand"));
 }
 
 /** Message-renderer tail: content lines in a padded, backgrounded box with a blank separator line. */
@@ -867,7 +889,7 @@ const runningSubagents = new Map<string, RunningSubagent>();
 let latestCtx: ExtensionContext | null = null;
 
 function formatElapsedMMSS(startTime: number): string {
-  const seconds = Math.floor((Date.now() - startTime) / 1000);
+  const seconds = elapsedSeconds(startTime);
   const m = Math.floor(seconds / 60);
   const s = seconds % 60;
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
@@ -1739,7 +1761,7 @@ async function launchSubagent(
   options?: { surface?: string },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
-  const id = Math.random().toString(16).slice(2, 10);
+  const id = randomHex(8);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
   const requestedModel = params.model ?? agentDefs?.model;
@@ -1790,12 +1812,7 @@ async function launchSubagent(
   // Timestamp + unique suffix so simultaneous launches never race on the
   // session file.
   const timestamp = `${new Date().toISOString().replace(/[:.]/g, "-").slice(0, 23)}Z`;
-  const uuid = [
-    id,
-    Math.random().toString(16).slice(2, 10),
-    Math.random().toString(16).slice(2, 10),
-    Math.random().toString(16).slice(2, 6),
-  ].join("-");
+  const uuid = [id, randomHex(8), randomHex(8), randomHex(4)].join("-");
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
   // Use pre-created surface (parallel mode) or create a new one.
@@ -2127,7 +2144,7 @@ async function watchSubagent(
     // supervision tick can observe a mid-completion state.
     running.completing = true;
 
-    const elapsed = Math.floor((Date.now() - startTime) / 1000);
+    const elapsed = elapsedSeconds(startTime);
 
     if (running.cli === "claude") {
       // Claude Code result extraction
@@ -2233,7 +2250,7 @@ async function watchSubagent(
         task,
         summary: "Subagent cancelled.",
         exitCode: 1,
-        elapsed: Math.floor((Date.now() - startTime) / 1000),
+        elapsed: elapsedSeconds(startTime),
         sessionFile,
       };
     }
@@ -2242,7 +2259,7 @@ async function watchSubagent(
       task,
       summary: `Subagent error: ${message}`,
       exitCode: 1,
-      elapsed: Math.floor((Date.now() - startTime) / 1000),
+      elapsed: elapsedSeconds(startTime),
     };
   }
 }
@@ -2430,14 +2447,7 @@ function registerSubagentSpawnTool(
 
         // "Started" result — tool returned immediately
         if (details.status === "started") {
-          return new Text(
-            theme.fg("accent", "▸") +
-              " " +
-              theme.fg("toolTitle", theme.bold(name)) +
-              theme.fg("dim", " — started"),
-            0,
-            0,
-          );
+          return targetCallText(name, theme, "started");
         }
 
         // Fallback (shouldn't happen)
@@ -2476,16 +2486,10 @@ function registerSubagentInterruptTool(
       renderResult(result, _opts, theme) {
         const details = detailsOf(result.details);
         if (details.status === "interrupt_requested") {
-          return new Text(
-            theme.fg("accent", "▸") +
-              " " +
-              theme.fg(
-                "toolTitle",
-                theme.bold(details.name ?? details.id ?? "subagent"),
-              ) +
-              theme.fg("dim", " — interrupt requested"),
-            0,
-            0,
+          return targetCallText(
+            details.name ?? details.id ?? "subagent",
+            theme,
+            "interrupt requested",
           );
         }
 
@@ -2597,11 +2601,7 @@ function registerSubagentMessageTool(
       renderCall(args, theme) {
         const target =
           args.name ?? args.id ?? (args.sessionFile ? "Resume" : "(unknown)");
-        const text =
-          "▸ " +
-          theme.fg("toolTitle", theme.bold(target)) +
-          theme.fg("dim", " — message");
-        return new Text(text, 0, 0);
+        return targetCallText(target, theme, "message");
       },
 
       renderResult(result, _opts, theme) {
@@ -2609,25 +2609,11 @@ function registerSubagentMessageTool(
         const name = details.name ?? "subagent";
 
         if (details.status === "delivered_live") {
-          return new Text(
-            theme.fg("accent", "▸") +
-              " " +
-              theme.fg("toolTitle", theme.bold(name)) +
-              theme.fg("dim", " — message delivered"),
-            0,
-            0,
-          );
+          return targetCallText(name, theme, "message delivered");
         }
 
         if (details.status === "started") {
-          return new Text(
-            theme.fg("accent", "▸") +
-              " " +
-              theme.fg("toolTitle", theme.bold(name)) +
-              theme.fg("dim", " — resumed"),
-            0,
-            0,
-          );
+          return targetCallText(name, theme, "resumed");
         }
 
         // Fallback
@@ -2701,7 +2687,7 @@ function registerSubagentMessageTool(
           autoExit: params.autoExit,
         });
         const startTime = Date.now();
-        const id = Math.random().toString(16).slice(2, 10);
+        const id = randomHex(8);
 
         if (!isMuxAvailable()) {
           return muxUnavailableResult();
@@ -2897,16 +2883,10 @@ function registerSubagentCloseTool(
       renderResult(result, _opts, theme) {
         const details = detailsOf(result.details);
         if (details.status === "closing") {
-          return new Text(
-            theme.fg("accent", "▸") +
-              " " +
-              theme.fg(
-                "toolTitle",
-                theme.bold(details.name ?? details.id ?? "subagent"),
-              ) +
-              theme.fg("dim", " — closing"),
-            0,
-            0,
+          return targetCallText(
+            details.name ?? details.id ?? "subagent",
+            theme,
+            "closing",
           );
         }
 
@@ -3100,9 +3080,7 @@ function registerSubagentMessageRenderers(pi: ExtensionAPI): void {
               );
             }
           }
-          contentLines.push(
-            theme.fg("muted", keyHint("app.tools.expand", "to expand")),
-          );
+          contentLines.push(expandHint(theme));
         }
 
         // Render via Box for background + padding, with blank line above for separation
@@ -3132,9 +3110,7 @@ function registerSubagentMessageRenderers(pi: ExtensionAPI): void {
           contentLines.push(theme.fg("muted", `+${overflow} more running.`));
         }
         if (!options.expanded) {
-          contentLines.push(
-            theme.fg("muted", keyHint("app.tools.expand", "to expand")),
-          );
+          contentLines.push(expandHint(theme));
         }
 
         return renderBoxLines(
@@ -3177,9 +3153,7 @@ function registerSubagentMessageRenderers(pi: ExtensionAPI): void {
             .split("\n")[0]
             .slice(0, width - 10);
           contentLines.push(theme.fg("dim", preview));
-          contentLines.push(
-            theme.fg("muted", keyHint("app.tools.expand", "to expand")),
-          );
+          contentLines.push(expandHint(theme));
         }
 
         return renderBoxLines(contentLines, bgFn, width);
