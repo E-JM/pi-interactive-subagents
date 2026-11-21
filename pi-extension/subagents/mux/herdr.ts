@@ -16,6 +16,7 @@ import { getSubagentLayoutMode } from "./layout-mode.ts";
 import { createTrackedPaneList } from "./tracked-panes.ts";
 import { execFileAsync, sleepSync } from "./util.ts";
 
+/** Extract the pane id from a herdr CLI JSON envelope (`pane split` / `tab create` output). */
 export function parseHerdrPaneId(output: string, context: string): string {
   const parsed = parseCmuxJson(output);
   const paneId =
