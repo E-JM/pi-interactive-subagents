@@ -13,13 +13,13 @@ import { join } from "node:path";
 import { after, before, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@mariozechner/pi-tui";
+import { initTheme } from "@mariozechner/pi-coding-agent";
 import {
   createSubagentActivityRecorder,
   getSubagentActivityFile,
   readSubagentActivityFile,
 } from "../pi-extension/subagents/activity.ts";
 import {
-  __pollForExitTest__,
   canSplitZellijPane,
   getSubagentLayoutMode,
   gridDimsForCount,
@@ -51,14 +51,11 @@ import {
   setTmuxSubagentPaneList,
   shellEscape,
 } from "../pi-extension/subagents/cmux.ts";
+import { __pollForExitTest__ } from "../pi-extension/subagents/exit-poll.ts";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 import {
-  appendBranchSummary,
-  copySessionFile,
   findLastAssistantMessage,
-  getLeafId,
   getNewEntries,
-  mergeNewEntries,
   seedSubagentSessionFile,
 } from "../pi-extension/subagents/session.ts";
 import {
@@ -290,24 +287,6 @@ describe("session.ts", () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  describe("getLeafId", () => {
-    it("returns last entry id", () => {
-      const file = createSessionFile(dir, [
-        SESSION_HEADER,
-        MODEL_CHANGE,
-        USER_MSG,
-        ASSISTANT_MSG,
-      ]);
-      assert.equal(getLeafId(file), "asst-001");
-    });
-
-    it("returns null for empty file", () => {
-      const file = join(dir, "empty.jsonl");
-      writeFileSync(file, "");
-      assert.equal(getLeafId(file), null);
-    });
-  });
-
   describe("getNewEntries", () => {
     it("returns entries after a given line", () => {
       const file = createSessionFile(dir, [
@@ -435,59 +414,6 @@ describe("session.ts", () => {
     });
   });
 
-  describe("appendBranchSummary", () => {
-    it("appends valid branch_summary entry", () => {
-      const file = createSessionFile(dir, [
-        SESSION_HEADER,
-        USER_MSG,
-        ASSISTANT_MSG,
-      ]);
-      const id = appendBranchSummary(
-        file,
-        "user-001",
-        "asst-001",
-        "The plan was created.",
-      );
-
-      assert.ok(id, "should return an id");
-      assert.equal(typeof id, "string");
-
-      // Read back and verify
-      const lines = readFileSync(file, "utf8").trim().split("\n");
-      assert.equal(lines.length, 4); // 3 original + 1 summary
-
-      const summary = JSON.parse(lines[3]);
-      assert.equal(summary.type, "branch_summary");
-      assert.equal(summary.id, id);
-      assert.equal(summary.parentId, "user-001");
-      assert.equal(summary.fromId, "asst-001");
-      assert.equal(summary.summary, "The plan was created.");
-      assert.ok(summary.timestamp);
-    });
-
-    it("uses branchPointId as fromId fallback", () => {
-      const file = createSessionFile(dir, [SESSION_HEADER]);
-      appendBranchSummary(file, "branch-pt", null, "summary");
-
-      const lines = readFileSync(file, "utf8").trim().split("\n");
-      const summary = JSON.parse(lines[1]);
-      assert.equal(summary.fromId, "branch-pt");
-    });
-  });
-
-  describe("copySessionFile", () => {
-    it("creates a copy with different path", () => {
-      const file = createSessionFile(dir, [SESSION_HEADER, USER_MSG]);
-      const copyDir = join(dir, "copies");
-      mkdirSync(copyDir, { recursive: true });
-      const copy = copySessionFile(file, copyDir);
-
-      assert.notEqual(copy, file);
-      assert.ok(copy.endsWith(".jsonl"));
-      assert.equal(readFileSync(copy, "utf8"), readFileSync(file, "utf8"));
-    });
-  });
-
   describe("seedSubagentSessionFile", () => {
     it("creates a lineage-only child session with parent linkage and no copied turns", () => {
       const parentFile = createSessionFile(dir, [
@@ -550,34 +476,6 @@ describe("session.ts", () => {
         entries.some((entry) => entry.type === "message"),
         false,
       );
-    });
-  });
-
-  describe("mergeNewEntries", () => {
-    it("appends new entries from source to target", () => {
-      // Source starts with same base (2 entries), then has 1 new entry
-      const sourceFile = join(dir, "merge-source.jsonl");
-      const targetFile = join(dir, "merge-target.jsonl");
-      writeFileSync(
-        sourceFile,
-        `${[SESSION_HEADER, USER_MSG, ASSISTANT_MSG]
-          .map((e) => JSON.stringify(e))
-          .join("\n")}\n`,
-      );
-      writeFileSync(
-        targetFile,
-        [SESSION_HEADER, USER_MSG].map((e) => JSON.stringify(e)).join("\n") +
-          "\n",
-      );
-
-      // Merge entries after line 2 (the shared base)
-      const merged = mergeNewEntries(sourceFile, targetFile, 2);
-      assert.equal(merged.length, 1);
-      assert.equal(merged[0].id, "asst-001");
-
-      // Target should now have 3 entries
-      const targetLines = readFileSync(targetFile, "utf8").trim().split("\n");
-      assert.equal(targetLines.length, 3);
     });
   });
 });
@@ -2367,6 +2265,57 @@ describe("tool execute error paths", () => {
       .join("\n");
     assert.match(rendered, /scout/);
     assert.match(rendered, /Which API should I use\?/);
+  });
+
+  it("subagent_result collapsed view previews 5 lines and hints at the rest", () => {
+    initTheme(); // collapsed views render the keyHint() expand line
+    const mock = boot();
+    const entry = mock.registeredMessageRenderers.find(
+      (e) => e.name === "subagent_result",
+    );
+    assert.ok(entry, "expected subagent_result renderer");
+    const summary = ["l1", "l2", "l3", "l4", "l5", "l6", "l7"].join("\n");
+    const rendered = entry
+      .renderer(
+        {
+          customType: "subagent_result",
+          content: `Sub-agent "worker" completed (42s).\n\n${summary}`,
+          details: { name: "worker", task: "t", elapsed: 42, exitCode: 0 },
+        },
+        { expanded: false },
+        theme,
+      )
+      .render(80)
+      .join("\n");
+    assert.match(rendered, /l1/);
+    assert.match(rendered, /l5/);
+    assert.doesNotMatch(rendered, /l6/);
+    assert.match(rendered, /… 2 more lines/);
+  });
+
+  it("subagent_ping collapsed view previews the first message line only", () => {
+    initTheme(); // collapsed views render the keyHint() expand line
+    const mock = boot();
+    const entry = mock.registeredMessageRenderers.find(
+      (e) => e.name === "subagent_ping",
+    );
+    assert.ok(entry, "expected subagent_ping renderer");
+    const rendered = entry
+      .renderer(
+        {
+          customType: "subagent_ping",
+          details: {
+            name: "scout",
+            message: "First line of the question\nsecond line",
+          },
+        },
+        { expanded: false },
+        theme,
+      )
+      .render(80)
+      .join("\n");
+    assert.match(rendered, /First line of the question/);
+    assert.doesNotMatch(rendered, /second line/);
   });
 });
 
@@ -5564,5 +5513,230 @@ describe("sanitizeInjectedMessage", () => {
     assert.equal(sanitized.length, 4_000 + "…[truncated]".length);
     assert.ok(sanitized.endsWith("…[truncated]"));
     assert.equal(sanitizeInjectedMessage("y".repeat(4_000)), "y".repeat(4_000));
+  });
+});
+
+describe("launch command primitives", () => {
+  const testApi = (subagentsModule as any).__test__;
+  const subagentDonePath = fileURLToPath(
+    new URL("../pi-extension/subagents/subagent-done.ts", import.meta.url),
+  );
+
+  it("builds the shared subagent env prefix in one fixed order", () => {
+    const prefix = testApi.buildSubagentEnvPrefix({
+      name: "Scout: Auth",
+      sessionFile: "/tmp/s.jsonl",
+      id: "ab12cd34",
+      activityFile: "/tmp/act.json",
+      agent: "scout",
+      surface: "pane.1",
+      autoExit: true,
+      denyTools: new Set(["bash", "write"]),
+      agentConfigDir: "/cfg",
+    });
+    assert.equal(
+      prefix,
+      "PI_CODING_AGENT_DIR='/cfg' PI_DENY_TOOLS='bash,write' " +
+        "PI_SUBAGENT_NAME='Scout: Auth' PI_SUBAGENT_AGENT='scout' " +
+        "PI_SUBAGENT_AUTO_EXIT=1 PI_SUBAGENT_SESSION='/tmp/s.jsonl' " +
+        "PI_SUBAGENT_ID='ab12cd34' PI_SUBAGENT_ACTIVITY_FILE='/tmp/act.json' " +
+        "PI_SUBAGENT_SURFACE='pane.1' ",
+    );
+  });
+
+  it("omits optional env assignments entirely when unspecified", () => {
+    assert.equal(
+      testApi.buildSubagentEnvPrefix({
+        name: "W",
+        sessionFile: "/s",
+        id: "i",
+        activityFile: "/a",
+      }),
+      "PI_SUBAGENT_NAME='W' PI_SUBAGENT_SESSION='/s' " +
+        "PI_SUBAGENT_ID='i' PI_SUBAGENT_ACTIVITY_FILE='/a' ",
+    );
+  });
+
+  it("assembles the pi invocation: cd + env + session + subagent-done + args + DONE marker", () => {
+    // Pin the mux away from herdr so the herdr-only `--tui-mode regular`
+    // injection stays out of this pin regardless of the host terminal
+    // (tmux hosts resolve the preference, herdr hosts fall back to null).
+    process.env.PI_SUBAGENT_MUX = "tmux";
+    try {
+      const command = testApi.buildPiInvocation({
+        sessionFile: "/tmp/s.jsonl",
+        envPrefix: "PI_SUBAGENT_NAME='W' ",
+        escapedArgs: [
+          "--model",
+          "'anthropic/claude-haiku-4-5'",
+          "'@/tmp/task.md'",
+        ],
+        effectiveCwd: "/home/user/proj",
+      });
+      assert.equal(
+        command,
+        "cd '/home/user/proj' && PI_SUBAGENT_NAME='W' " +
+          `pi --session '/tmp/s.jsonl' -e '${subagentDonePath}' ` +
+          "--model 'anthropic/claude-haiku-4-5' '@/tmp/task.md'; " +
+          "echo '__SUBAGENT_DONE_'$?'__'",
+      );
+    } finally {
+      delete process.env.PI_SUBAGENT_MUX;
+    }
+  });
+
+  it("forces --tui-mode regular on herdr (alt-screen breaks the exit poll)", () => {
+    // herdr runtime availability needs the env trio plus a herdr on PATH;
+    // stub the binary so this pin holds on hosts that never run herdr.
+    const stubBin = mkdtempSync(join(tmpdir(), "pi-stub-bin-"));
+    writeFileSync(join(stubBin, "herdr"), "#!/bin/sh\nexit 0\n", {
+      mode: 0o755,
+    });
+    const savedPath = process.env.PATH;
+    process.env.PATH = `${stubBin}:${savedPath}`;
+    process.env.PI_SUBAGENT_MUX = "herdr";
+    process.env.HERDR_ENV = "1";
+    process.env.HERDR_PANE_ID = "stub:p1";
+    try {
+      const command = testApi.buildPiInvocation({
+        sessionFile: "/tmp/s.jsonl",
+        envPrefix: "PI_SUBAGENT_NAME='W' ",
+        escapedArgs: [],
+        effectiveCwd: "/home/user/proj",
+      });
+      assert.match(
+        command,
+        / pi --session '\/tmp\/s\.jsonl' --tui-mode regular /,
+      );
+    } finally {
+      process.env.PATH = savedPath;
+      delete process.env.PI_SUBAGENT_MUX;
+      delete process.env.HERDR_ENV;
+      delete process.env.HERDR_PANE_ID;
+      rmSync(stubBin, { recursive: true, force: true });
+    }
+  });
+
+  it("builds the claude invocation with sentinel, plugin dir, and params-over-defaults prompt", () => {
+    const { command, sentinelFile } = testApi.buildClaudeCommand({
+      id: "ab12cd34",
+      task: "do the thing",
+      systemPrompt: "PROMPT",
+      resumeSessionId: "sess-1",
+      model: "claude-sonnet-4",
+      agentBody: "You are Scout.",
+      effectiveCwd: "/w",
+    });
+    assert.equal(sentinelFile, "/tmp/pi-claude-ab12cd34-done");
+    assert.ok(command.startsWith("cd '/w' && "));
+    assert.ok(
+      command.includes("PI_CLAUDE_SENTINEL='/tmp/pi-claude-ab12cd34-done'"),
+    );
+    assert.ok(command.includes("claude --dangerously-skip-permissions"));
+    // The repo ships pi-extension/subagents/plugin, so the flag is present.
+    assert.ok(command.includes("--plugin-dir"));
+    assert.ok(command.includes("--model 'claude-sonnet-4'"));
+    // params.systemPrompt wins over the agent-file body on the claude path.
+    assert.ok(command.includes("--append-system-prompt 'PROMPT'"));
+    assert.ok(command.includes("--resume 'sess-1'"));
+    assert.ok(
+      command.endsWith("'do the thing'; echo '__SUBAGENT_DONE_'$?'__'"),
+    );
+  });
+
+  it("falls back to error/exit/placeholder summaries in order", () => {
+    assert.equal(
+      testApi.exitSummaryFallback({
+        exitCode: 0,
+        errorMessage: "overloaded",
+      }),
+      "Subagent error: overloaded",
+    );
+    assert.equal(
+      testApi.exitSummaryFallback({ exitCode: 3 }),
+      "Sub-agent exited with code 3",
+    );
+    assert.equal(
+      testApi.exitSummaryFallback({ exitCode: 0 }),
+      "Sub-agent exited without output",
+    );
+    assert.equal(
+      testApi.exitSummaryFallback(
+        { exitCode: 0 },
+        "Resumed session",
+        "new output",
+      ),
+      "Resumed session exited without new output",
+    );
+  });
+
+  it("returns the bare task for fork mode and wraps blank-session tasks per delivery lane", () => {
+    assert.equal(
+      testApi.composeFullTask({
+        task: "T",
+        roleBlock: "\n\nR",
+        inheritsConversationContext: true,
+        autoExit: false,
+        interactive: true,
+      }),
+      "T",
+    );
+
+    const interactive = testApi.composeFullTask({
+      task: "T",
+      roleBlock: "\n\nIDENT",
+      inheritsConversationContext: false,
+      autoExit: false,
+      interactive: true,
+    });
+    assert.ok(interactive.startsWith("\n\nIDENT\n\n"));
+    assert.ok(interactive.includes("call the subagent_done tool"));
+    assert.ok(interactive.includes("T\n\nYour FINAL assistant message"));
+
+    const autonomous = testApi.composeFullTask({
+      task: "T",
+      roleBlock: "",
+      inheritsConversationContext: false,
+      autoExit: false,
+      interactive: false,
+    });
+    assert.ok(autonomous.includes("end your turn with a clear summary"));
+    assert.ok(autonomous.includes("Do NOT call subagent_done"));
+
+    const autoExit = testApi.composeFullTask({
+      task: "T",
+      roleBlock: "",
+      inheritsConversationContext: false,
+      autoExit: true,
+      interactive: false,
+    });
+    assert.ok(autoExit.includes("Complete your task autonomously."));
+  });
+});
+
+describe("getShellReadyDelayMs", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  it("returns 500 by default and honors a valid override", () => {
+    const prev = process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
+    try {
+      delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
+      assert.equal(testApi.getShellReadyDelayMs(), 500);
+
+      process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "2500";
+      assert.equal(testApi.getShellReadyDelayMs(), 2500);
+
+      process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "not-a-number";
+      assert.equal(testApi.getShellReadyDelayMs(), 500);
+
+      process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = "-5";
+      assert.equal(testApi.getShellReadyDelayMs(), 500);
+    } finally {
+      if (prev === undefined) {
+        delete process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS;
+      } else {
+        process.env.PI_SUBAGENT_SHELL_READY_DELAY_MS = prev;
+      }
+    }
   });
 });
