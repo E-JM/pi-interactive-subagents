@@ -53,12 +53,10 @@ export function resolveDenyTools(agentDefs: AgentDefaults | null): Set<string> {
   const denied = new Set<string>();
   if (!agentDefs) return denied;
 
-  // spawning: false → deny all spawning tools
   if (agentDefs.spawning === false) {
     for (const t of SPAWNING_TOOLS) denied.add(t);
   }
 
-  // deny-tools: explicit list
   if (agentDefs.denyTools) {
     for (const t of agentDefs.denyTools
       .split(",")

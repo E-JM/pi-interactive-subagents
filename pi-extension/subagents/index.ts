@@ -89,12 +89,10 @@ export const __test__ = {
 };
 
 export default function subagentsExtension(pi: ExtensionAPI) {
-  // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
     setLatestContext(ctx);
   });
 
-  // Clean up on session shutdown
   pi.on("session_shutdown", (_event, _ctx) => {
     clearStoredInterval(WIDGET_INTERVAL_KEY);
     clearStoredInterval(STATUS_INTERVAL_KEY);
